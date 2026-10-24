@@ -18,6 +18,7 @@ import {
 } from "./lib/supabaseRest.js";
 import { compressReceiptImage, fileToDataUrl, readReceipt } from "./lib/receiptOcr.js";
 import { printFinancialReport } from "./lib/reports.js";
+import { allocateSplits, calculateBalances, calculateSettlements, normalizeAmount } from "./lib/domain.js";
 import "./App.css";
 
 const LOCAL_KEY = "hostelsplit-v2";
@@ -46,12 +47,6 @@ function money(value, currency) {
   } catch {
     return "₹" + amount.toLocaleString("en-IN", { maximumFractionDigits: 2 });
   }
-}
-
-function normalizeAmount(value) {
-  const amount = Number(value);
-  if (!Number.isFinite(amount) || amount <= 0 || !Number.isSafeInteger(Math.round(amount * 100))) return null;
-  return Math.round(amount * 100) / 100;
 }
 
 function normalizeMembers(rawMembers) {
@@ -150,78 +145,6 @@ function loadLocalData() {
   } catch {
     return { group: null, members: [], expenses: [], settlements: [], budgets: [] };
   }
-}
-
-function allocateSplits(amount, selectedIds, splitType, splitValues) {
-  const totalCents = Math.round(Number(amount) * 100);
-  if (!Number.isSafeInteger(totalCents) || totalCents <= 0 || selectedIds.length === 0) {
-    throw new Error("Choose at least one person and enter a valid amount.");
-  }
-
-  if (splitType === "equal") {
-    const base = Math.floor(totalCents / selectedIds.length);
-    const remainder = totalCents % selectedIds.length;
-    return selectedIds.map((memberId, index) => ({ memberId, amount: (base + (index < remainder ? 1 : 0)) / 100 }));
-  }
-
-  const values = selectedIds.map((memberId) => {
-    const value = Number(splitValues[memberId]);
-    if (!Number.isFinite(value) || value < 0) throw new Error("Every selected member needs a valid non-negative split value.");
-    return value;
-  });
-
-  if (splitType === "exact") {
-    const cents = values.map((value) => Math.round(value * 100));
-    if (cents.some((value) => !Number.isSafeInteger(value))) throw new Error("One of the split amounts is too large.");
-    const sum = cents.reduce((total, value) => total + value, 0);
-    if (sum !== totalCents) throw new Error("The custom amounts must add up exactly to the expense total.");
-    return selectedIds.map((memberId, index) => ({ memberId, amount: cents[index] / 100 }));
-  }
-
-  const totalPercent = values.reduce((total, value) => total + value, 0);
-  if (Math.abs(totalPercent - 100) > 0.01) throw new Error("Custom percentages must add up to 100%.");
-  const rawCents = values.map((value) => totalCents * value / 100);
-  const cents = rawCents.map(Math.floor);
-  let remainder = totalCents - cents.reduce((total, value) => total + value, 0);
-  const order = rawCents.map((value, index) => ({ index, remainder: value - Math.floor(value) }))
-    .sort((a, b) => b.remainder - a.remainder);
-  for (let index = 0; index < remainder; index += 1) cents[order[index % order.length].index] += 1;
-  return selectedIds.map((memberId, index) => ({ memberId, amount: cents[index] / 100 }));
-}
-
-function calculateBalances(members, expenses, settlements) {
-  const balances = Object.fromEntries(members.map((member) => [member.id, { paid: 0, share: 0, balance: 0 }]));
-  expenses.forEach((expense) => {
-    if (balances[expense.paidBy]) balances[expense.paidBy].paid += expense.amount;
-    (expense.splits || []).forEach((split) => {
-      if (balances[split.memberId]) balances[split.memberId].share += split.amount;
-    });
-  });
-  (settlements || []).filter((settlement) => settlement.status === "paid").forEach((settlement) => {
-    if (balances[settlement.from]) balances[settlement.from].paid += Number(settlement.amount);
-    if (balances[settlement.to]) balances[settlement.to].paid -= Number(settlement.amount);
-  });
-  Object.values(balances).forEach((item) => { item.balance = Math.round((item.paid - item.share) * 100) / 100; });
-  return balances;
-}
-
-function calculateSettlements(balances) {
-  const debtors = Object.entries(balances).filter((entry) => entry[1].balance < -0.005)
-    .map(([id, value]) => ({ id, amount: Math.round(-value.balance * 100) }));
-  const creditors = Object.entries(balances).filter((entry) => entry[1].balance > 0.005)
-    .map(([id, value]) => ({ id, amount: Math.round(value.balance * 100) }));
-  const result = [];
-  let i = 0;
-  let j = 0;
-  while (i < debtors.length && j < creditors.length) {
-    const cents = Math.min(debtors[i].amount, creditors[j].amount);
-    if (cents > 0) result.push({ from: debtors[i].id, to: creditors[j].id, amount: cents / 100 });
-    debtors[i].amount -= cents;
-    creditors[j].amount -= cents;
-    if (debtors[i].amount < 1) i += 1;
-    if (creditors[j].amount < 1) j += 1;
-  }
-  return result;
 }
 
 function firstError(error, fallback) {
@@ -352,6 +275,7 @@ function App() {
     receiptFile: null, receiptDataUrl: "", receiptPath: "", receiptText: "", suggestedAmount: null,
   });
 
+  const hasSession = Boolean(session);
   const cloudSession = cloudConfigured && !localMode && Boolean(session && user);
   const isCloud = cloudSession && Boolean(group && group.source === "cloud");
 
@@ -440,7 +364,7 @@ function App() {
         selectRows("group_members", { select: "user_id,display_name,role,joined_at", group_id: "eq." + groupId, order: "joined_at.asc" }, activeSession),
         selectRows("expenses", { select: "*,expense_splits(user_id,share_amount)", group_id: "eq." + groupId, order: "expense_date.desc,created_at.desc" }, activeSession),
         selectRows("settlements", { select: "*", group_id: "eq." + groupId, order: "created_at.desc" }, activeSession),
-        selectRows("budgets", { select: "*", group_id: "eq." + groupId, month: "eq." + currentMonth() }, activeSession),
+        selectRows("budgets", { select: "*", group_id: "eq." + groupId, order: "month.desc" }, activeSession),
       ]);
       const loadedMembers = normalizeMembers(memberRows);
       const loadedExpenses = (expenseRows || []).map((expense) => normalizeExpense({
@@ -501,7 +425,7 @@ function App() {
   const recommendedSettlements = useMemo(() => calculateSettlements(balances), [balances]);
   const currency = group && group.currency ? group.currency : "INR";
   const totalSpent = useMemo(() => expenses.reduce((sum, expense) => sum + expense.amount, 0), [expenses]);
-  const monthlyExpenses = useMemo(() => expenses.filter((expense) => String(expense.date).slice(0, 7) === monthFilter), [expenses, monthFilter]);
+  const monthlyExpenses = useMemo(() => monthFilter ? expenses.filter((expense) => String(expense.date).slice(0, 7) === monthFilter) : expenses, [expenses, monthFilter]);
   const monthlyTotal = useMemo(() => monthlyExpenses.reduce((sum, expense) => sum + expense.amount, 0), [monthlyExpenses]);
   const categoryTotals = useMemo(() => {
     const result = {};
@@ -943,7 +867,7 @@ function App() {
         }], session, "group_id,month,category");
         const rows = await selectRows("groups", { select: "id,name,invite_code,currency,monthly_budget,created_by,created_at", id: "eq." + group.id }, session);
         if (rows && rows[0]) setGroup({ ...rows[0], source: "cloud" });
-        const budgetsData = await selectRows("budgets", { select: "*", group_id: "eq." + group.id, month: "eq." + monthDate }, session);
+        const budgetsData = await selectRows("budgets", { select: "*", group_id: "eq." + group.id, order: "month.desc" }, session);
         setBudgets(budgetsData || []);
       } else {
         setGroup((current) => current ? { ...current, monthly_budget: Math.round(overall * 100) / 100 } : current);
