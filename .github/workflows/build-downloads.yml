@@ -69,3 +69,38 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
+
+  publish-direct-downloads:
+    name: Publish direct download links
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Android APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: HostelSplit-Android-APK
+          path: release-assets/android
+      - name: Download Windows app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: HostelSplit-PC-Windows
+          path: release-assets/windows
+      - name: Give APK a simple filename
+        run: cp release-assets/android/app-debug.apk release-assets/HostelSplit.apk
+      - name: Publish direct assets on GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-downloads
+          name: HostelSplit Latest Downloads
+          body: "Direct install/download files for HostelSplit. The APK is an Android debug build."
+          draft: false
+          prerelease: false
+          make_latest: true
+          overwrite_files: true
+          files: |
+            release-assets/HostelSplit.apk
+            release-assets/windows/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
