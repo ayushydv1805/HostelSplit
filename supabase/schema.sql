@@ -105,14 +105,75 @@ alter table public.expense_splits enable row level security;
 alter table public.settlements enable row level security;
 alter table public.budgets enable row level security;
 
--- Groups: a creator can see the row while creating the first membership.
+-- Keep RLS helpers in a non-exposed schema to avoid recursive group_members policies.
+-- Do not add the private schema to the Supabase Data API exposed schemas list.
+create schema if not exists private;
+revoke all on schema private from public, anon;
+grant usage on schema private to authenticated;
+
+create or replace function private.hostelsplit_is_group_member(p_group_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.group_members gm
+    where gm.group_id = p_group_id
+      and gm.user_id = (select auth.uid())
+  );
+$$;
+
+create or replace function private.hostelsplit_is_group_owner(p_group_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.group_members gm
+    where gm.group_id = p_group_id
+      and gm.user_id = (select auth.uid())
+      and gm.role = 'owner'
+  );
+$$;
+
+create or replace function private.hostelsplit_can_share_with_user(p_group_id uuid, p_target_user_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select
+    (select auth.uid()) is not null
+    and exists (
+      select 1
+      from public.group_members actor
+      join public.group_members target on target.group_id = actor.group_id
+      where actor.group_id = p_group_id
+        and actor.user_id = (select auth.uid())
+        and target.user_id = p_target_user_id
+    );
+$$;
+
+revoke all on function private.hostelsplit_is_group_member(uuid) from public, anon;
+revoke all on function private.hostelsplit_is_group_owner(uuid) from public, anon;
+revoke all on function private.hostelsplit_can_share_with_user(uuid, uuid) from public, anon;
+grant execute on function private.hostelsplit_is_group_member(uuid) to authenticated;
+grant execute on function private.hostelsplit_is_group_owner(uuid) to authenticated;
+grant execute on function private.hostelsplit_can_share_with_user(uuid, uuid) to authenticated;
+
+-- Groups: creators see new groups; members see only their shared groups.
 drop policy if exists "groups_read_members" on public.groups;
 create policy "groups_read_members" on public.groups for select to authenticated
 using (
-  created_by = (select auth.uid()) or exists (
-    select 1 from public.group_members gm
-    where gm.group_id = groups.id and gm.user_id = (select auth.uid())
-  )
+  created_by = (select auth.uid())
+  or (select private.hostelsplit_is_group_member(id))
 );
 
 drop policy if exists "groups_create_self" on public.groups;
@@ -121,54 +182,52 @@ with check (created_by = (select auth.uid()));
 
 drop policy if exists "groups_update_owner" on public.groups;
 create policy "groups_update_owner" on public.groups for update to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = groups.id and gm.user_id = (select auth.uid()) and gm.role = 'owner'
-))
-with check (created_by = (select auth.uid()));
+using ((select private.hostelsplit_is_group_owner(id)))
+with check (
+  created_by = (select auth.uid())
+  and (select private.hostelsplit_is_group_owner(id))
+);
 
 drop policy if exists "groups_delete_owner" on public.groups;
 create policy "groups_delete_owner" on public.groups for delete to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = groups.id and gm.user_id = (select auth.uid()) and gm.role = 'owner'
-));
+using ((select private.hostelsplit_is_group_owner(id)));
 
--- Members: users see fellow members only when they share a group.
+-- Group members: an authenticated member can see others in that same group.
 drop policy if exists "members_read_group" on public.group_members;
 create policy "members_read_group" on public.group_members for select to authenticated
-using (user_id = (select auth.uid()) or exists (
-  select 1 from public.group_members own
-  where own.group_id = group_members.group_id and own.user_id = (select auth.uid())
-));
+using (
+  user_id = (select auth.uid())
+  or (select private.hostelsplit_is_group_member(group_id))
+);
 
 drop policy if exists "members_owner_add" on public.group_members;
 create policy "members_owner_add" on public.group_members for insert to authenticated
 with check (
-  user_id = (select auth.uid()) and exists (
+  user_id = (select auth.uid())
+  and exists (
     select 1 from public.groups g
-    where g.id = group_members.group_id and g.created_by = (select auth.uid())
+    where g.id = group_members.group_id
+      and g.created_by = (select auth.uid())
   )
 );
 
 drop policy if exists "members_self_leave_or_owner_manage" on public.group_members;
 create policy "members_self_leave_or_owner_manage" on public.group_members for delete to authenticated
 using (
-  user_id = (select auth.uid()) or exists (
-    select 1 from public.group_members own
-    where own.group_id = group_members.group_id and own.user_id = (select auth.uid()) and own.role = 'owner'
-  )
+  user_id = (select auth.uid())
+  or (select private.hostelsplit_is_group_owner(group_id))
 );
 
--- Joining by invite code is the only narrowly scoped SECURITY DEFINER operation.
+-- Joining uses a narrowly scoped invite-code function. The function checks auth.uid()
+-- and only adds the caller to the exact group that owns the supplied valid code.
 create or replace function public.join_hostelsplit_group(p_invite_code text)
 returns uuid
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 declare
-  v_user_id uuid := auth.uid();
+  v_user_id uuid := (select auth.uid());
   v_group_id uuid;
   v_display_name text;
 begin
@@ -179,18 +238,22 @@ begin
     raise exception 'Enter a valid invite code.';
   end if;
 
-  select id into v_group_id
-  from public.groups
-  where invite_code = upper(trim(p_invite_code));
+  select g.id into v_group_id
+  from public.groups g
+  where g.invite_code = upper(trim(p_invite_code));
 
   if v_group_id is null then
     raise exception 'No group was found for that invite code.';
   end if;
 
-  select coalesce(nullif(trim(raw_user_meta_data ->> 'display_name'), ''), split_part(email, '@', 1), 'Member')
+  select coalesce(
+    nullif(trim(u.raw_user_meta_data ->> 'display_name'), ''),
+    split_part(u.email, '@', 1),
+    'Member'
+  )
   into v_display_name
-  from auth.users
-  where id = v_user_id;
+  from auth.users u
+  where u.id = v_user_id;
 
   insert into public.group_members(group_id, user_id, display_name, role)
   values (v_group_id, v_user_id, left(v_display_name, 80), 'member')
@@ -203,135 +266,108 @@ $$;
 revoke all on function public.join_hostelsplit_group(text) from public, anon;
 grant execute on function public.join_hostelsplit_group(text) to authenticated;
 
--- Expense rows are visible and editable only by members of their group.
+-- Expense rows are isolated by membership; the payer must belong to the same group.
 drop policy if exists "expenses_read_group" on public.expenses;
 create policy "expenses_read_group" on public.expenses for select to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = expenses.group_id and gm.user_id = (select auth.uid())
-));
+using ((select private.hostelsplit_is_group_member(group_id)));
 
 drop policy if exists "expenses_create_member" on public.expenses;
 create policy "expenses_create_member" on public.expenses for insert to authenticated
 with check (
   created_by = (select auth.uid())
-  and exists (select 1 from public.group_members gm where gm.group_id = expenses.group_id and gm.user_id = (select auth.uid()))
-  and exists (select 1 from public.group_members payer where payer.group_id = expenses.group_id and payer.user_id = expenses.paid_by)
+  and (select private.hostelsplit_is_group_member(group_id))
+  and (select private.hostelsplit_can_share_with_user(group_id, paid_by))
 );
 
 drop policy if exists "expenses_update_member" on public.expenses;
 create policy "expenses_update_member" on public.expenses for update to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = expenses.group_id and gm.user_id = (select auth.uid())
-))
+using ((select private.hostelsplit_is_group_member(group_id)))
 with check (
-  created_by = (select auth.uid())
-  and exists (select 1 from public.group_members gm where gm.group_id = expenses.group_id and gm.user_id = (select auth.uid()))
-  and exists (select 1 from public.group_members payer where payer.group_id = expenses.group_id and payer.user_id = expenses.paid_by)
+  (select private.hostelsplit_is_group_member(group_id))
+  and (select private.hostelsplit_can_share_with_user(group_id, paid_by))
 );
 
 drop policy if exists "expenses_delete_member" on public.expenses;
 create policy "expenses_delete_member" on public.expenses for delete to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = expenses.group_id and gm.user_id = (select auth.uid())
-));
+using ((select private.hostelsplit_is_group_member(group_id)));
 
+-- Splits can only refer to users who belong to the same expense group.
 drop policy if exists "splits_read_group" on public.expense_splits;
 create policy "splits_read_group" on public.expense_splits for select to authenticated
 using (exists (
   select 1 from public.expenses e
-  join public.group_members gm on gm.group_id = e.group_id
-  where e.id = expense_splits.expense_id and gm.user_id = (select auth.uid())
+  where e.id = expense_splits.expense_id
+    and (select private.hostelsplit_is_group_member(e.group_id))
 ));
 
 drop policy if exists "splits_add_member" on public.expense_splits;
 create policy "splits_add_member" on public.expense_splits for insert to authenticated
-with check (
-  exists (
-    select 1 from public.expenses e
-    join public.group_members actor on actor.group_id = e.group_id
-    join public.group_members split_person on split_person.group_id = e.group_id and split_person.user_id = expense_splits.user_id
-    where e.id = expense_splits.expense_id and actor.user_id = (select auth.uid())
-  )
-);
+with check (exists (
+  select 1 from public.expenses e
+  where e.id = expense_splits.expense_id
+    and (select private.hostelsplit_can_share_with_user(e.group_id, expense_splits.user_id))
+));
 
 drop policy if exists "splits_update_member" on public.expense_splits;
 create policy "splits_update_member" on public.expense_splits for update to authenticated
 using (exists (
   select 1 from public.expenses e
-  join public.group_members gm on gm.group_id = e.group_id
-  where e.id = expense_splits.expense_id and gm.user_id = (select auth.uid())
+  where e.id = expense_splits.expense_id
+    and (select private.hostelsplit_is_group_member(e.group_id))
 ))
 with check (exists (
   select 1 from public.expenses e
-  join public.group_members actor on actor.group_id = e.group_id
-  join public.group_members split_person on split_person.group_id = e.group_id and split_person.user_id = expense_splits.user_id
-  where e.id = expense_splits.expense_id and actor.user_id = (select auth.uid())
+  where e.id = expense_splits.expense_id
+    and (select private.hostelsplit_can_share_with_user(e.group_id, expense_splits.user_id))
 ));
 
 drop policy if exists "splits_delete_member" on public.expense_splits;
 create policy "splits_delete_member" on public.expense_splits for delete to authenticated
 using (exists (
   select 1 from public.expenses e
-  join public.group_members gm on gm.group_id = e.group_id
-  where e.id = expense_splits.expense_id and gm.user_id = (select auth.uid())
+  where e.id = expense_splits.expense_id
+    and (select private.hostelsplit_is_group_member(e.group_id))
 ));
 
+-- Settlements: both endpoints must be members of the corresponding group.
 drop policy if exists "settlements_read_group" on public.settlements;
 create policy "settlements_read_group" on public.settlements for select to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = settlements.group_id and gm.user_id = (select auth.uid())
-));
+using ((select private.hostelsplit_is_group_member(group_id)));
 
 drop policy if exists "settlements_add_member" on public.settlements;
 create policy "settlements_add_member" on public.settlements for insert to authenticated
 with check (
   created_by = (select auth.uid())
-  and exists (select 1 from public.group_members gm where gm.group_id = settlements.group_id and gm.user_id = (select auth.uid()))
-  and exists (select 1 from public.group_members gm where gm.group_id = settlements.group_id and gm.user_id = settlements.from_user)
-  and exists (select 1 from public.group_members gm where gm.group_id = settlements.group_id and gm.user_id = settlements.to_user)
+  and (select private.hostelsplit_is_group_member(group_id))
+  and (select private.hostelsplit_can_share_with_user(group_id, from_user))
+  and (select private.hostelsplit_can_share_with_user(group_id, to_user))
 );
 
 drop policy if exists "settlements_update_member" on public.settlements;
 create policy "settlements_update_member" on public.settlements for update to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = settlements.group_id and gm.user_id = (select auth.uid())
-))
+using ((select private.hostelsplit_is_group_member(group_id)))
 with check (
   created_by = (select auth.uid())
-  and exists (select 1 from public.group_members gm where gm.group_id = settlements.group_id and gm.user_id = (select auth.uid()))
+  and (select private.hostelsplit_is_group_member(group_id))
+  and (select private.hostelsplit_can_share_with_user(group_id, from_user))
+  and (select private.hostelsplit_can_share_with_user(group_id, to_user))
 );
 
 drop policy if exists "settlements_delete_member" on public.settlements;
 create policy "settlements_delete_member" on public.settlements for delete to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = settlements.group_id and gm.user_id = (select auth.uid())
-));
+using ((select private.hostelsplit_is_group_member(group_id)));
 
+-- Only the group owner may change budgets.
 drop policy if exists "budgets_read_group" on public.budgets;
 create policy "budgets_read_group" on public.budgets for select to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = budgets.group_id and gm.user_id = (select auth.uid())
-));
+using ((select private.hostelsplit_is_group_member(group_id)));
 
 drop policy if exists "budgets_owner_write" on public.budgets;
 create policy "budgets_owner_write" on public.budgets for all to authenticated
-using (exists (
-  select 1 from public.group_members gm
-  where gm.group_id = budgets.group_id and gm.user_id = (select auth.uid()) and gm.role = 'owner'
-))
+using ((select private.hostelsplit_is_group_owner(group_id)))
 with check (
   created_by = (select auth.uid())
-  and exists (
-    select 1 from public.group_members gm
-    where gm.group_id = budgets.group_id and gm.user_id = (select auth.uid()) and gm.role = 'owner'
-  )
+  and (select private.hostelsplit_is_group_owner(group_id))
 );
 
 grant usage on schema public to authenticated;
