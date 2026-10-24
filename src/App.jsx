@@ -276,6 +276,24 @@ function App() {
     setSearchExpense("");
   };
 
+  const beginNewGroup = () => {
+    if (!window.confirm("Start a new group? This replaces the current group and deletes its saved data. Export your expenses first if you need a copy.")) return;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(BACKUP_STORAGE_KEY);
+    } catch {
+      window.alert("Browser storage could not be cleared. Please check your browser privacy settings.");
+      return;
+    }
+    setGroupName("");
+    setMembers([]);
+    setExpenses([]);
+    setPaidSettlements([]);
+    setSearchExpense("");
+    setNewMember("");
+    setShowCreate(true);
+  };
+
   const settlementKey = (settlement) => `${settlement.from}|${settlement.to}|${settlement.amount.toFixed(2)}`;
   const togglePaid = (settlement) => {
     const key = settlementKey(settlement);
@@ -324,6 +342,7 @@ function App() {
           <div className="brand-button"><span>💸</span> HostelSplit</div>
           <div className="nav-actions">
             <button className="icon-btn" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>
+            <button className="secondary-btn new-group-btn" onClick={beginNewGroup}>＋ New Group</button>
             <button className="danger-btn" onClick={clearGroup}>🗑 Clear Group</button>
           </div>
         </nav>
