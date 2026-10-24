@@ -1,6 +1,6 @@
 const CACHE_PREFIX = "hostelsplit-shell-";
 const CACHE_VERSION = CACHE_PREFIX + "v1";
-const PRECACHE_URLS = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg"];
+const PRECACHE_URLS = ["/", "/index.html", "/manifest.webmanifest", "/hostelsplit-icon.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
