@@ -1,0 +1,19 @@
+{
+  "name": "HostelSplit — Shared Expenses",
+  "short_name": "HostelSplit",
+  "description": "Split hostel, flat and trip expenses with clear balances and fewer payments.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f5f7fb",
+  "theme_color": "#635bff",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
