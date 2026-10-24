@@ -30,7 +30,6 @@ const CATEGORY_ICONS = {
   Utilities: "💡", Supplies: "🧻", Other: "📦",
 };
 const today = () => new Date().toISOString().slice(0, 10);
-const currentMonth = () => today().slice(0, 7) + "-01";
 
 function makeId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
@@ -249,6 +248,8 @@ function App() {
   });
   const [authBusy, setAuthBusy] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
+  const [lastSyncAt, setLastSyncAt] = useState(null);
+  const [groupListVersion, setGroupListVersion] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -346,13 +347,14 @@ function App() {
     };
     loadGroups();
     return () => { active = false; };
-  }, [cloudSession, session]);
+  }, [cloudSession, session, groupListVersion]);
 
   const activeMonthStart = (monthFilter || new Date().toISOString().slice(0, 7)) + "-01";
-  const loadCloudData = useCallback(async (groupId, activeSession) => {
+  const loadCloudData = useCallback(async (groupId, activeSession, options = {}) => {
     if (!groupId || !activeSession) return;
-    setLoadingData(true);
-    setError("");
+    const silent = Boolean(options.silent);
+    if (!silent) setLoadingData(true);
+    if (!silent) setError("");
     try {
       const selectedGroups = await selectRows("groups", {
         select: "id,name,invite_code,currency,monthly_budget,created_by,created_at",
@@ -392,10 +394,11 @@ function App() {
       setSettlements(loadedSettlements);
       setBudgets(Array.isArray(budgetRows) ? budgetRows : []);
       setActiveGroupId(groupId);
+      setLastSyncAt(new Date().toISOString());
     } catch (caught) {
-      setError("Could not load this group: " + firstError(caught, "Check Supabase schema, table exposure and row-level security."));
+      if (!silent) setError("Could not load this group: " + firstError(caught, "Check Supabase schema, table exposure and row-level security."));
     } finally {
-      setLoadingData(false);
+      if (!silent) setLoadingData(false);
     }
   }, []);
 
@@ -409,6 +412,15 @@ function App() {
     load();
     return () => { active = false; };
   }, [cloudSession, activeGroupId, session, loadCloudData]);
+
+  useEffect(() => {
+    if (!cloudSession || !activeGroupId || !session) return undefined;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible" || busy || showExpenseForm || showBudgetForm || showGroupForm) return;
+      loadCloudData(activeGroupId, session, { silent: true });
+    }, 20000);
+    return () => window.clearInterval(timer);
+  }, [cloudSession, activeGroupId, session, loadCloudData, busy, showExpenseForm, showBudgetForm, showGroupForm]);
 
   useEffect(() => {
     if (isCloud || !group || group.source === "cloud") return;
@@ -437,8 +449,10 @@ function App() {
     monthlyExpenses.forEach((expense) => { result[expense.category] = (result[expense.category] || 0) + expense.amount; });
     return result;
   }, [monthlyExpenses]);
-  const overallBudget = Number((budgets.find((item) => item.category === "All" && item.month === activeMonthStart) || {}).amount || (group && group.monthly_budget) || 0);
+  const overallBudgetRecord = budgets.find((item) => item.category === "All" && item.month === activeMonthStart);
+  const overallBudget = overallBudgetRecord ? Number(overallBudgetRecord.amount || 0) : Number((!isCloud && group && group.monthly_budget) || 0);
   const selectedCategoryBudget = budgets.find((item) => item.category === categoryBudgetName && item.month === activeMonthStart);
+  const isGroupOwner = !isCloud || Boolean(user && (group.created_by === user.id || members.some((member) => member.id === user.id && member.role === "owner")));
   const filteredExpenses = useMemo(() => {
     const search = query.trim().toLowerCase();
     return expenses.filter((expense) => {
@@ -583,13 +597,19 @@ function App() {
   };
 
   const clearGroup = async () => {
-    if (!window.confirm("Delete this group and all its expenses, budgets and settlements? This cannot be undone.")) return;
+    const message = isCloud && !isGroupOwner
+      ? "Leave this group on this account? Its expenses and history will remain for the other members."
+      : "Delete this group and all its expenses, budgets and settlements? This cannot be undone.";
+    if (!window.confirm(message)) return;
     setBusy(true);
     try {
       if (isCloud) {
-        await deleteRows("groups", { id: "eq." + group.id }, session);
-        const remaining = cloudGroups.filter((item) => item.id !== group.id);
-        setCloudGroups(remaining);
+        if (isGroupOwner) {
+          await deleteRows("groups", { id: "eq." + group.id }, session);
+        } else {
+          await deleteRows("group_members", { group_id: "eq." + group.id, user_id: "eq." + user.id }, session);
+        }
+        setCloudGroups((current) => current.filter((item) => item.id !== group.id));
         setActiveGroupId("");
         settleCurrentGroup();
       } else {
@@ -600,7 +620,7 @@ function App() {
       }
       setNotice("Group deleted.");
     } catch (caught) {
-      setError("Could not delete this group: " + firstError(caught, "Only the group owner may delete it."));
+      setError("Could not " + (isCloud && !isGroupOwner ? "leave this group: " : "delete this group: ") + firstError(caught, "Check your group permissions and try again."));
     } finally {
       setBusy(false);
     }
@@ -858,13 +878,10 @@ function App() {
       const monthDate = activeMonthStart;
       if (isCloud) {
         await updateRows("groups", { id: "eq." + group.id }, { monthly_budget: Math.round(overall * 100) / 100 }, session);
-        await insertRows("budgets", [{
-          group_id: group.id,
-          month: monthDate,
-          category: categoryBudgetName,
-          amount: Math.round(categoryAmount * 100) / 100,
-          created_by: user.id,
-        }], session, "group_id,month,category");
+        await insertRows("budgets", [
+          { group_id: group.id, month: monthDate, category: "All", amount: Math.round(overall * 100) / 100, created_by: user.id },
+          { group_id: group.id, month: monthDate, category: categoryBudgetName, amount: Math.round(categoryAmount * 100) / 100, created_by: user.id },
+        ], session, "group_id,month,category");
         const rows = await selectRows("groups", { select: "id,name,invite_code,currency,monthly_budget,created_by,created_at", id: "eq." + group.id }, session);
         if (rows && rows[0]) setGroup({ ...rows[0], source: "cloud" });
         const budgetsData = await selectRows("budgets", { select: "*", group_id: "eq." + group.id, order: "month.desc" }, session);
@@ -872,8 +889,11 @@ function App() {
       } else {
         setGroup((current) => current ? { ...current, monthly_budget: Math.round(overall * 100) / 100 } : current);
         setBudgets((current) => {
-          const withoutCategory = current.filter((item) => !(item.month === monthDate && item.category === categoryBudgetName));
-          return [...withoutCategory, { id: makeId(), month: monthDate, category: categoryBudgetName, amount: Math.round(categoryAmount * 100) / 100 }];
+          const withoutCurrent = current.filter((item) => !(item.month === monthDate && (item.category === "All" || item.category === categoryBudgetName)));
+          return [...withoutCurrent,
+            { id: makeId(), month: monthDate, category: "All", amount: Math.round(overall * 100) / 100 },
+            { id: makeId(), month: monthDate, category: categoryBudgetName, amount: Math.round(categoryAmount * 100) / 100 },
+          ];
         });
       }
       setShowBudgetForm(false);
@@ -945,12 +965,15 @@ function App() {
 
   const exportPdf = () => {
     try {
+      const reportExpenses = expenses.filter((expense) => !monthFilter || expense.date.slice(0, 7) === monthFilter);
+      const reportSettlements = settlements.filter((item) => item.status === "paid" && (!monthFilter || String(item.date || item.createdAt || "").slice(0, 7) === monthFilter));
+      const reportBalances = calculateBalances(members, reportExpenses, reportSettlements);
       printFinancialReport({
         groupName: group ? group.name : "HostelSplit",
         members,
-        expenses: expenses.filter((expense) => !monthFilter || expense.date.slice(0, 7) === monthFilter),
-        balances,
-        settlements: recommendedSettlements,
+        expenses: reportExpenses,
+        balances: reportBalances,
+        settlements: calculateSettlements(reportBalances),
         budget: overallBudget,
         month: monthFilter || "All months",
       });
@@ -1018,9 +1041,9 @@ function App() {
         <div className="nav-actions">
           {isCloud && <span className="secure-tag desktop-only">☁ Synced</span>}
           <button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>
-          {isCloud && <button className="btn secondary desktop-only" onClick={() => { setActiveGroupId(""); setGroup(null); }}>All groups</button>}
+          {isCloud && <button className="btn secondary desktop-only" onClick={() => { setActiveGroupId(""); setGroup(null); setGroupListVersion((value) => value + 1); }}>All groups</button>}
           {isCloud && <button className="btn secondary desktop-only" onClick={handleLogout}>Sign out</button>}
-          <button className="btn secondary" onClick={clearGroup} disabled={busy}>Delete group</button>
+          <button className="btn secondary" onClick={clearGroup} disabled={busy}>{isCloud && !isGroupOwner ? "Leave group" : "Delete group"}</button>
         </div>
       </nav>
       <main className="page-shell">
@@ -1064,7 +1087,7 @@ function App() {
           </div>
 
           <div className="panel budget-panel">
-            <div className="section-heading"><div><h2>Monthly budget</h2><p>Monitor the current month and category limits.</p></div><button className="text-button" onClick={() => { setBudgetInput(String(overallBudget || "")); setCategoryBudgetInput(String(selectedCategoryBudget?.amount || "")); setShowBudgetForm(true); }}>Edit budgets</button></div>
+            <div className="section-heading"><div><h2>Monthly budget</h2><p>Monitor the current month and category limits.</p></div>{isGroupOwner ? <button className="text-button" onClick={() => { setBudgetInput(String(overallBudget || "")); setCategoryBudgetInput(String(selectedCategoryBudget?.amount || "")); setShowBudgetForm(true); }}>Edit budgets</button> : <span className="muted tiny">Owner-managed</span>}</div>
             <div className="budget-summary"><div><small>Spent in {monthFilter}</small><strong>{money(monthlyTotal, currency)}</strong></div><div className="budget-target"><small>Budget</small><strong>{overallBudget > 0 ? money(overallBudget, currency) : "Not set"}</strong></div></div>
             {overallBudget > 0 ? <><div className="progress-track"><div className={"progress-fill " + (monthlyBudgetUsage > 100 ? "over-budget" : "")} style={{ width: Math.min(100, monthlyBudgetUsage) + "%" }} /></div><div className="budget-foot"><span>{Math.round(monthlyBudgetUsage)}% used</span><strong className={monthlyBudgetUsage > 100 ? "negative-text" : "positive-text"}>{monthlyBudgetUsage > 100 ? money(monthlyTotal - overallBudget, currency) + " over" : money(overallBudget - monthlyTotal, currency) + " left"}</strong></div></> : <EmptyState icon="◎" title="Set a spending limit" body="Set a group budget and optional category limits to keep costs under control." action={<button className="btn secondary" onClick={() => { setBudgetInput(""); setCategoryBudgetInput(""); setShowBudgetForm(true); }}>Set budget</button>} />}
             <div className="mini-category-list">{CATEGORIES.filter((category) => monthlyCategoryTotals[category]).slice(0, 4).map((category) => {
