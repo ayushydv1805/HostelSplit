@@ -1,6 +1,6 @@
 const STORAGE_KEY = "hostelsplit-auth-session-v1";
 const SUPABASE_URL = String(import.meta.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
-const SUPABASE_KEY = String(import.meta.env.VITE_SUPABASE_ANON_KEY || "").trim();
+const SUPABASE_KEY = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || import.meta.env.VITE_SUPABASE_ANON_KEY || "").trim();
 
 export const cloudConfigured = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
@@ -31,7 +31,7 @@ async function readResponse(response) {
 
 function saveSession(session) {
   if (!session) {
-    try { localStorage.removeItem(STORAGE_KEY); } catch { /* Storage may be blocked. */ }
+    clearCachedSession();
     return null;
   }
   const saved = {
@@ -40,6 +40,10 @@ function saveSession(session) {
   };
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(saved)); } catch { /* Auth remains usable for this tab. */ }
   return saved;
+}
+
+export function clearCachedSession() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch { /* Storage may be blocked. */ }
 }
 
 export function getCachedSession() {
