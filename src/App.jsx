@@ -268,6 +268,7 @@ function App() {
   const [monthFilter, setMonthFilter] = useState(new Date().toISOString().slice(0, 7));
   const [showGroupForm, setShowGroupForm] = useState(false);
   const [groupNameInput, setGroupNameInput] = useState("");
+  const [groupCurrencyInput, setGroupCurrencyInput] = useState("INR");
   const [initialMembersInput, setInitialMembersInput] = useState("");
   const [inviteCodeInput, setInviteCodeInput] = useState("");
   const [showExpenseForm, setShowExpenseForm] = useState(false);
@@ -513,7 +514,7 @@ function App() {
         const created = await insertRows("groups", [{
           name,
           created_by: user.id,
-          currency: "INR",
+          currency: groupCurrencyInput,
           monthly_budget: 0,
         }], session);
         if (!created || !created[0]) throw new Error("The group was not created.");
@@ -525,17 +526,19 @@ function App() {
         }], session);
         setShowGroupForm(false);
         setGroupNameInput("");
+        setGroupCurrencyInput("INR");
         await loadCloudGroupsAfterCreate(created[0].id);
         setNotice("Group created. Share its invite code with other signed-in HostelSplit users.");
       } else {
         const localMembers = normalizeMembers([...new Set(parsedNames.map((item) => item.replace(/\s+/g, " ")))]);
-        setGroup({ id: "local-" + makeId(), name, currency: "INR", monthly_budget: 0, source: "local" });
+        setGroup({ id: "local-" + makeId(), name, currency: groupCurrencyInput, monthly_budget: 0, source: "local" });
         setMembers(localMembers);
         setExpenses([]);
         setSettlements([]);
         setBudgets([]);
         setShowGroupForm(false);
         setGroupNameInput("");
+        setGroupCurrencyInput("INR");
         setInitialMembersInput("");
         setNotice("Your local group is ready.");
       }
@@ -1012,7 +1015,7 @@ function App() {
           </div>}
           <form className="join-card" onSubmit={handleJoinGroup}><div><h2>Join with invite code</h2><p>Ask a group owner for the code, then join from your own account.</p></div><div className="join-controls"><input value={inviteCodeInput} onChange={(event) => setInviteCodeInput(event.target.value.toUpperCase())} placeholder="E.g. A1B2C3D4" maxLength={10} aria-label="Invite code" /><button className="btn primary" type="submit" disabled={busy}>Join group</button></div></form>
         </main>
-        {showGroupForm && <div className="modal-backdrop"><form className="modal" onSubmit={handleCreateGroup}><button type="button" className="close-button" onClick={() => setShowGroupForm(false)} aria-label="Close">×</button><span className="eyebrow">NEW WORKSPACE</span><h2>Create a shared group</h2><p>Friends can join from their own accounts using a private invite code.</p><label>Group name<input value={groupNameInput} onChange={(event) => setGroupNameInput(event.target.value)} autoFocus required maxLength={100} placeholder="e.g. Hostel Room 603" /></label>{error && <div className="alert error">{error}</div>}<button className="btn primary full" disabled={busy}>{busy ? "Creating…" : "Create group"}</button></form></div>}
+        {showGroupForm && <div className="modal-backdrop"><form className="modal" onSubmit={handleCreateGroup}><button type="button" className="close-button" onClick={() => setShowGroupForm(false)} aria-label="Close">×</button><span className="eyebrow">NEW WORKSPACE</span><h2>Create a shared group</h2><p>Friends can join from their own accounts using a private invite code.</p><label>Group name<input value={groupNameInput} onChange={(event) => setGroupNameInput(event.target.value)} autoFocus required maxLength={100} placeholder="e.g. Hostel Room 603" /></label><label>Currency<select value={groupCurrencyInput} onChange={(event) => setGroupCurrencyInput(event.target.value)}><option value="INR">INR · Indian Rupee (₹)</option><option value="USD">USD · US Dollar ($)</option><option value="EUR">EUR · Euro (€)</option><option value="GBP">GBP · Pound Sterling (£)</option><option value="NPR">NPR · Nepalese Rupee (रू)</option><option value="CAD">CAD · Canadian Dollar (C$)</option><option value="AUD">AUD · Australian Dollar (A$)</option></select></label>{error && <div className="alert error">{error}</div>}<button className="btn primary full" disabled={busy}>{busy ? "Creating…" : "Create group"}</button></form></div>}
       </div>
     );
   }
@@ -1029,7 +1032,7 @@ function App() {
         </main>
         {error && <div className="floating-message error">{error}</div>}
         {notice && <div className="floating-message success">{notice}</div>}
-        {showGroupForm && <div className="modal-backdrop"><form className="modal" onSubmit={handleCreateGroup}><button type="button" className="close-button" onClick={() => setShowGroupForm(false)} aria-label="Close">×</button><span className="eyebrow">NEW GROUP</span><h2>Create your group</h2><p>{cloudSession ? "A private invite code will be created so other users can join." : "Start a local group on this device. Add at least two members."}</p><label>Group name<input value={groupNameInput} onChange={(event) => setGroupNameInput(event.target.value)} required autoFocus maxLength={100} placeholder="e.g. Hostel Room 603" /></label>{!cloudSession && <label>Members, separated by commas<input value={initialMembersInput} onChange={(event) => setInitialMembersInput(event.target.value)} required placeholder="e.g. Ayush, Rahul, Aman" /></label>}{error && <div className="alert error">{error}</div>}<button className="btn primary full" disabled={busy}>{busy ? "Creating…" : "Create group"}</button></form></div>}
+        {showGroupForm && <div className="modal-backdrop"><form className="modal" onSubmit={handleCreateGroup}><button type="button" className="close-button" onClick={() => setShowGroupForm(false)} aria-label="Close">×</button><span className="eyebrow">NEW GROUP</span><h2>Create your group</h2><p>{cloudSession ? "A private invite code will be created so other users can join." : "Start a local group on this device. Add at least two members."}</p><label>Group name<input value={groupNameInput} onChange={(event) => setGroupNameInput(event.target.value)} required autoFocus maxLength={100} placeholder="e.g. Hostel Room 603" /></label><label>Currency<select value={groupCurrencyInput} onChange={(event) => setGroupCurrencyInput(event.target.value)}><option value="INR">INR · Indian Rupee (₹)</option><option value="USD">USD · US Dollar ($)</option><option value="EUR">EUR · Euro (€)</option><option value="GBP">GBP · Pound Sterling (£)</option><option value="NPR">NPR · Nepalese Rupee (रू)</option><option value="CAD">CAD · Canadian Dollar (C$)</option><option value="AUD">AUD · Australian Dollar (A$)</option></select></label>{!cloudSession && <label>Members, separated by commas<input value={initialMembersInput} onChange={(event) => setInitialMembersInput(event.target.value)} required placeholder="e.g. Ayush, Rahul, Aman" /></label>}{error && <div className="alert error">{error}</div>}<button className="btn primary full" disabled={busy}>{busy ? "Creating…" : "Create group"}</button></form></div>}
       </div>
     );
   }
