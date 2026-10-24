@@ -1279,6 +1279,7 @@ function App() {
           {isCloud && <button className="btn secondary desktop-only" onClick={() => { setActiveGroupId(""); setGroup(null); setGroupListVersion((value) => value + 1); }}>All groups</button>}
           {isCloud && <button className="btn secondary desktop-only" onClick={handleLogout}>Sign out</button>}
           {!isCloud && localProfile && <><span className="user-chip desktop-only">{localProfile.displayName}</span><button className="btn secondary" onClick={handleLocalLogout}>Sign out</button></>}
+          {!isCloud && !localProfile && <button className="btn secondary" onClick={() => { if (cloudConfigured) { setLocalMode(false); setSession(getCachedSession()); } else { setShowLocalAuth(true); setError(""); } }}>Log in / Sign up</button>}
           <button className="btn secondary" onClick={clearGroup} disabled={busy}>{isCloud && !isGroupOwner ? "Leave group" : "Delete group"}</button>
         </div>
       </nav>
