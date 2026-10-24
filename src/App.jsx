@@ -128,7 +128,7 @@ function loadLocalData() {
           expenses: (old.expenses || []).map((expense) => normalizeExpense({
             ...expense,
             paidBy: expense.paidBy,
-            splits: (expense.members || []).map((memberId) => ({ memberId, amount: Number(expense.amount || 0) / Math.max(1, expense.members.length) })),
+
           }, oldMembers)).filter(Boolean),
           settlements: [],
           budgets: [],
@@ -365,7 +365,8 @@ function App() {
   }, [darkMode]);
 
   useEffect(() => {
-    if (localMode || !cloudConfigured || !session) return undefined;
+    const hasSession = Boolean(session);
+    if (localMode || !cloudConfigured || !hasSession) return undefined;
     let active = true;
     const verifySession = async () => {
       try {
@@ -387,7 +388,7 @@ function App() {
     };
     verifySession();
     return () => { active = false; };
-  }, [localMode, session]);
+  }, [localMode, Boolean(session)]);
 
   useEffect(() => {
     if (!cloudSession) {
@@ -423,7 +424,7 @@ function App() {
     return () => { active = false; };
   }, [cloudSession, session]);
 
-  const activeMonthStart = monthFilter + "-01";
+  const activeMonthStart = (monthFilter || new Date().toISOString().slice(0, 7)) + "-01";
   const loadCloudData = useCallback(async (groupId, activeSession) => {
     if (!groupId || !activeSession) return;
     setLoadingData(true);
@@ -539,6 +540,12 @@ function App() {
     setLocalMode(false);
     setSession(newSession);
     setUser(newUser);
+    setGroup(null);
+    setMembers([]);
+    setExpenses([]);
+    setSettlements([]);
+    setBudgets([]);
+    setActiveGroupId("");
     setError("");
     setNotice("Signed in successfully.");
   };
@@ -608,6 +615,14 @@ function App() {
       order: "created_at.desc",
     }, session);
     setCloudGroups(Array.isArray(rows) ? rows : []);
+    const selected = Array.isArray(rows) ? rows.find((item) => item.id === createdId) : null;
+    if (selected) {
+      setGroup({ ...selected, source: "cloud" });
+      setMembers([{ id: user.id, name: user.user_metadata && user.user_metadata.display_name ? user.user_metadata.display_name : String(user.email || "Owner").split("@")[0], role: "owner" }]);
+      setExpenses([]);
+      setSettlements([]);
+      setBudgets([]);
+    }
     setActiveGroupId(createdId);
   };
 
@@ -632,6 +647,12 @@ function App() {
   };
 
   const changeGroup = (id) => {
+    const selected = cloudGroups.find((item) => item.id === id);
+    if (selected) setGroup({ ...selected, source: "cloud" });
+    setMembers([]);
+    setExpenses([]);
+    setSettlements([]);
+    setBudgets([]);
     setError("");
     setNotice("");
     setActiveGroupId(id);
@@ -821,7 +842,6 @@ function App() {
         setExpenses((current) => editingExpenseId
           ? current.map((item) => item.id === editingExpenseId ? expense : item)
           : [expense, ...current]);
-        setSettlements((current) => current.filter((item) => item.status !== "paid"));
       }
       setShowExpenseForm(false);
       setEditingExpenseId("");
@@ -842,7 +862,6 @@ function App() {
         await loadCloudData(group.id, session);
       } else {
         setExpenses((current) => current.filter((item) => item.id !== expense.id));
-        setSettlements((current) => current.filter((item) => item.status !== "paid"));
       }
       setNotice("Expense deleted.");
     } catch (caught) {
@@ -1029,7 +1048,7 @@ function App() {
     return <AuthScreen onBack={switchOffline} onComplete={onAuthComplete} />;
   }
 
-  if (cloudSession && !activeGroupId && !group?.source?.includes("local")) {
+  if (cloudSession && !activeGroupId) {
     return (
       <div className={"app " + (darkMode ? "dark" : "")}>
         <nav className="navbar"><a className="brand" href="#" onClick={(event) => event.preventDefault()}><span className="brand-mark">H</span> HostelSplit</a><div className="nav-actions"><button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button><span className="user-chip">{user.email}</span><button className="btn secondary" onClick={handleLogout}>Sign out</button></div></nav>
