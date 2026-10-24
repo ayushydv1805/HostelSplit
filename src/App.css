@@ -103,3 +103,14 @@ button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+
+.new-group-btn { padding: 10px 13px; box-shadow: none; white-space: nowrap; }
+.new-group-btn:hover { border-color: rgba(99, 91, 255, .35); }
+@media (max-width: 620px) {
+  .navbar { height: auto; min-height: 68px; padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+  .navbar .nav-actions { gap: 6px; margin-left: auto; }
+  .new-group-btn { padding: 9px 10px; font-size: 12px; }
+  .brand-button { font-size: 18px; gap: 7px; }
+  .brand-button span { font-size: 22px; }
+}
