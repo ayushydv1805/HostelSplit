@@ -13,7 +13,7 @@ function money(value) {
 }
 
 export function printFinancialReport({ groupName, members, expenses, balances, settlements, budget, month }) {
-  const popup = window.open("", "_blank", "noopener,noreferrer,width=920,height=760");
+  const popup = window.open("", "_blank", "width=920,height=760");
   if (!popup) throw new Error("Your browser blocked the report window. Allow pop-ups for this site and try again.");
 
   const total = expenses.reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
