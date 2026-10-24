@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   callRpc,
+  clearCachedSession,
   cloudConfigured,
   deleteRows,
   getCachedSession,
@@ -290,7 +291,6 @@ function App() {
   }, [darkMode]);
 
   useEffect(() => {
-    const hasSession = Boolean(session);
     if (localMode || !cloudConfigured || !hasSession) return undefined;
     let active = true;
     const verifySession = async () => {
@@ -305,6 +305,7 @@ function App() {
         }
       } catch (caught) {
         if (active) {
+          clearCachedSession();
           setSession(null);
           setUser(null);
           setError("Your cloud session expired. Please sign in again. " + firstError(caught, ""));
@@ -313,7 +314,7 @@ function App() {
     };
     verifySession();
     return () => { active = false; };
-  }, [localMode, Boolean(session)]);
+  }, [localMode, hasSession]);
 
   useEffect(() => {
     if (!cloudSession) {
