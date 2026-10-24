@@ -321,7 +321,7 @@ function LocalAuthScreen({ onBack, onComplete }) {
     setError("");
     setNotice("");
     const normalizedEmail = email.trim().toLowerCase();
-    if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(normalizedEmail)) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       setError("Enter a valid email address.");
       return;
     }
@@ -350,7 +350,7 @@ function LocalAuthScreen({ onBack, onComplete }) {
         const salt = makeLocalSalt();
         account = {
           email: normalizedEmail,
-          displayName: displayName.trim().replace(/\\s+/g, " ").slice(0, 80),
+          displayName: displayName.trim().replace(/\s+/g, " ").slice(0, 80),
           salt,
           passwordHash: await hashLocalPassword(password, salt),
           createdAt: new Date().toISOString(),
