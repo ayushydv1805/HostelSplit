@@ -24,6 +24,8 @@ import { allocateSplits, calculateBalances, calculateSettlements, normalizeAmoun
 import "./App.css";
 
 const LOCAL_KEY = "hostelsplit-v2";
+const LOCAL_ACCOUNTS_KEY = "hostelsplit-local-accounts-v1";
+const LOCAL_SESSION_KEY = "hostelsplit-local-session-v1";
 const LEGACY_KEY = "hostelsplit-data";
 const LEGACY_BACKUP_KEY = "hostelsplit-data-backup";
 const CATEGORIES = ["Food", "Travel", "Hotel", "Shopping", "Entertainment", "Utilities", "Supplies", "Other"];
@@ -40,6 +42,42 @@ const today = () => {
 
 function makeId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+function localDataKey(email) {
+  return LOCAL_KEY + ":profile:" + String(email || "").trim().toLowerCase();
+}
+
+function readLocalProfileSession() {
+  try {
+    const profile = JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || "null");
+    if (!profile || typeof profile.email !== "string" || !profile.email.includes("@")) return null;
+    return {
+      email: profile.email.trim().toLowerCase(),
+      displayName: String(profile.displayName || profile.email.split("@")[0]).trim().slice(0, 80),
+      id: String(profile.id || ("local-" + profile.email.trim().toLowerCase())),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function hashLocalPassword(password, salt) {
+  if (!globalThis.crypto || !globalThis.crypto.subtle) {
+    throw new Error("Secure password hashing is unavailable in this WebView. Update Android System WebView or Chrome and try again.");
+  }
+  const digest = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(salt + ":" + password)
+  );
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function makeLocalSalt() {
+  if (!globalThis.crypto || !globalThis.crypto.getRandomValues) {
+    throw new Error("Secure random generation is unavailable in this WebView. Update Android System WebView or Chrome and try again.");
+  }
+  return Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function money(value, currency) {
@@ -120,11 +158,13 @@ function normalizeExpense(raw, members) {
   };
 }
 
-function loadLocalData() {
+function loadLocalData(storageKey = LOCAL_KEY) {
   try {
-    let saved = localStorage.getItem(LOCAL_KEY);
+    let saved = localStorage.getItem(storageKey);
     if (!saved) {
-      const legacy = localStorage.getItem(LEGACY_KEY) || localStorage.getItem(LEGACY_BACKUP_KEY);
+      const legacy = storageKey === LOCAL_KEY
+        ? (localStorage.getItem(LEGACY_KEY) || localStorage.getItem(LEGACY_BACKUP_KEY))
+        : null;
       if (legacy) {
         const old = JSON.parse(legacy);
         const oldMembers = normalizeMembers(old.members);
@@ -139,7 +179,7 @@ function loadLocalData() {
           settlements: [],
           budgets: [],
         };
-        localStorage.setItem(LOCAL_KEY, JSON.stringify(migrated));
+        localStorage.setItem(storageKey, JSON.stringify(migrated));
         return migrated;
       }
       return { group: null, members: [], expenses: [], settlements: [], budgets: [] };
@@ -266,15 +306,126 @@ function AuthScreen({ onBack, onComplete }) {
   );
 }
 
-function EmptyState({ icon, title, body, action }) {
+
+function LocalAuthScreen({ onBack, onComplete }) {
+  const [view, setView] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setError("");
+    setNotice("");
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(normalizedEmail)) {
+      setError("Enter a valid email address.");
+      return;
+    }
+    if (password.length < 8) {
+      setError("Use a password with at least 8 characters.");
+      return;
+    }
+    if (view === "signup" && !displayName.trim()) {
+      setError("Enter your name.");
+      return;
+    }
+
+    setBusy(true);
+    try {
+      let accounts = {};
+      try {
+        accounts = JSON.parse(localStorage.getItem(LOCAL_ACCOUNTS_KEY) || "{}");
+      } catch {
+        accounts = {};
+      }
+      if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) accounts = {};
+
+      let account = accounts[normalizedEmail];
+      if (view === "signup") {
+        if (account) throw new Error("An account with this email already exists on this device. Sign in instead.");
+        const salt = makeLocalSalt();
+        account = {
+          email: normalizedEmail,
+          displayName: displayName.trim().replace(/\\s+/g, " ").slice(0, 80),
+          salt,
+          passwordHash: await hashLocalPassword(password, salt),
+          createdAt: new Date().toISOString(),
+        };
+        accounts[normalizedEmail] = account;
+        localStorage.setItem(LOCAL_ACCOUNTS_KEY, JSON.stringify(accounts));
+      } else {
+        if (!account) throw new Error("No local profile was found for this email on this device. Create an account first.");
+        const enteredHash = await hashLocalPassword(password, account.salt);
+        if (enteredHash !== account.passwordHash) throw new Error("Incorrect password. Please try again.");
+      }
+
+      const profile = {
+        id: "local-" + normalizedEmail,
+        email: normalizedEmail,
+        displayName: String(account.displayName || normalizedEmail.split("@")[0]),
+      };
+      localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(profile));
+      onComplete(profile, view === "signup");
+    } catch (caught) {
+      setError(firstError(caught, "Could not open your local profile. Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="auth-shell">
+      <nav className="navbar">
+        <a className="brand" href="#" onClick={(event) => { event.preventDefault(); onBack(); }}><span className="brand-mark">H</span> HostelSplit</a>
+        <span className="live-pill"><span /> Device-only profile</span>
+      </nav>
+      <main className="auth-layout">
+        <section className="auth-story">
+          <span className="eyebrow">YOUR EXPENSES, KEPT ON YOUR DEVICE</span>
+          <h1>Your hostel finances, saved as you go.</h1>
+          <p>Create a profile to keep your HostelSplit data organized on this device. Your groups, expenses, settlements and budgets are saved automatically.</p>
+          <div className="auth-points"><span>✓ Data survives app restarts</span><span>✓ Separate data for each profile</span><span>✓ Works offline</span></div>
+        </section>
+        <form className="auth-card" onSubmit={submit}>
+          <div className="auth-card-icon">✦</div>
+          <h2>{view === "signin" ? "Welcome back" : "Create a device profile"}</h2>
+          <p>{view === "signin" ? "Sign in to your saved local profile." : "Make a profile for this device in a few seconds."}</p>
+          {view === "signup" && <label>Your name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="name" required placeholder="e.g. Ayush Yadav" /></label>}
+          <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required placeholder="you@example.com" /></label>
+          <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={view === "signin" ? "current-password" : "new-password"} minLength={8} required placeholder="At least 8 characters" /></label>
+          {error && <div className="alert error" role="alert">{error}</div>}
+          {notice && <div className="alert success" role="status">{notice}</div>}
+          <button className="btn primary full" type="submit" disabled={busy}>{busy ? "Please wait…" : view === "signin" ? "Sign in" : "Create account"}</button>
+          <div className="auth-links">
+            <button type="button" onClick={() => { setView(view === "signup" ? "signin" : "signup"); setError(""); setNotice(""); }}>{view === "signup" ? "Already have a profile? Sign in" : "New here? Create an account"}</button>
+          </div>
+          <button type="button" className="btn secondary full" onClick={onBack}>Continue without signing in</button>
+          <small className="muted tiny">Device-only profile: your data is stored in this app/browser and does not sync to other devices. Do not reuse an important password; use a dedicated Supabase backend for real cloud accounts.</small>
+        </form>
+      </main>
+    </div>
+  );
+}
+
+function EmptyState({ icon, title, body, action })
   return <div className="empty-state"><div className="empty-icon">{icon || "✦"}</div><h3>{title}</h3><p>{body}</p>{action}</div>;
 }
 
 function App() {
-  const [initialLocal] = useState(loadLocalData);
-  const [localMode, setLocalMode] = useState(!cloudConfigured);
-  const [session, setSession] = useState(() => cloudConfigured ? getCachedSession() : null);
-  const [user, setUser] = useState(null);
+  const [localProfile, setLocalProfile] = useState(readLocalProfileSession);
+  const [initialLocal] = useState(() => loadLocalData(localProfile ? localDataKey(localProfile.email) : LOCAL_KEY));
+  const [localMode, setLocalMode] = useState(() => !cloudConfigured || Boolean(localProfile));
+  const [session, setSession] = useState(() => cloudConfigured && !localProfile ? getCachedSession() : null);
+  const [showLocalAuth, setShowLocalAuth] = useState(false);
+  const [user, setUser] = useState(() => localProfile ? {
+    id: localProfile.id,
+    email: localProfile.email,
+    user_metadata: { display_name: localProfile.displayName },
+  } : null);
   const [cloudGroups, setCloudGroups] = useState([]);
   const [activeGroupId, setActiveGroupId] = useState("");
   const [group, setGroup] = useState(initialLocal.group);
@@ -454,12 +605,12 @@ function App() {
     if (isCloud || !group || group.source === "cloud") return;
     const snapshot = { group, members, expenses, settlements, budgets };
     try {
-      localStorage.setItem(LOCAL_KEY, JSON.stringify(snapshot));
+      localStorage.setItem(localProfile ? localDataKey(localProfile.email) : LOCAL_KEY, JSON.stringify(snapshot));
       // Keep old backup data out of the new storage path; Clear Group removes both.
     } catch {
       window.setTimeout(() => setError("Browser storage is full. Export your expenses and remove a receipt image or large browser data before continuing."), 0);
     }
-  }, [isCloud, group, members, expenses, settlements, budgets]);
+  }, [isCloud, group, members, expenses, settlements, budgets, localProfile]);
 
   const balances = useMemo(() => calculateBalances(members, expenses, settlements), [members, expenses, settlements]);
   const recommendedSettlements = useMemo(() => calculateSettlements(balances), [balances]);
@@ -506,6 +657,7 @@ function App() {
     setLocalMode(false);
     setSession(newSession);
     setUser(newUser);
+    setLocalProfile(null);
     setGroup(null);
     setMembers([]);
     setExpenses([]);
@@ -514,6 +666,50 @@ function App() {
     setActiveGroupId("");
     setError("");
     setNotice("Signed in successfully.");
+  };
+
+  const onLocalAuthComplete = (profile, isNewAccount) => {
+    const key = localDataKey(profile.email);
+    try {
+      if (isNewAccount && !localStorage.getItem(key)) {
+        const existingLocalData = localStorage.getItem(LOCAL_KEY);
+        if (existingLocalData) localStorage.setItem(key, existingLocalData);
+      }
+      localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(profile));
+    } catch {
+      // The app still opens; the data-save effect will show a storage warning if needed.
+    }
+    setLocalProfile(profile);
+    setLocalMode(true);
+    setSession(null);
+    setUser({ id: profile.id, email: profile.email, user_metadata: { display_name: profile.displayName } });
+    const data = loadLocalData(key);
+    setGroup(data.group);
+    setMembers(data.members);
+    setExpenses(data.expenses);
+    setSettlements(data.settlements || []);
+    setBudgets(data.budgets || []);
+    setActiveGroupId("");
+    setShowLocalAuth(false);
+    setError("");
+    setNotice(isNewAccount ? "Profile created. Your data will save automatically on this device." : "Signed in. Your saved data has been loaded.");
+  };
+
+  const handleLocalLogout = () => {
+    try { localStorage.removeItem(LOCAL_SESSION_KEY); } catch { /* Optional browser session cleanup. */ }
+    setLocalProfile(null);
+    setLocalMode(true);
+    setSession(null);
+    setUser(null);
+    setGroup(null);
+    setMembers([]);
+    setExpenses([]);
+    setSettlements([]);
+    setBudgets([]);
+    setActiveGroupId("");
+    setShowLocalAuth(false);
+    setError("");
+    setNotice("Signed out. Your saved profile and data remain on this device.");
   };
 
   const handleLogout = async () => {
@@ -1025,6 +1221,10 @@ function App() {
     setNotice("Offline mode selected. Data is stored only in this browser.");
   };
 
+  if (!cloudConfigured && showLocalAuth) {
+    return <LocalAuthScreen onBack={() => setShowLocalAuth(false)} onComplete={onLocalAuthComplete} />;
+  }
+
   if (cloudConfigured && !localMode && (!session || !user)) {
     return <AuthScreen onBack={switchOffline} onComplete={onAuthComplete} />;
   }
@@ -1051,7 +1251,7 @@ function App() {
   if (!group) {
     return (
       <div className={"app " + (darkMode ? "dark" : "")}>
-        <nav className="navbar"><a className="brand" href="#" onClick={(event) => event.preventDefault()}><span className="brand-mark">H</span> HostelSplit</a><div className="nav-actions"><button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>{cloudSession ? <button className="btn secondary" onClick={handleLogout}>Sign out</button> : cloudConfigured && <button className="btn secondary" onClick={() => { setLocalMode(false); setSession(getCachedSession()); }}>Cloud login</button>}</div></nav>
+        <nav className="navbar"><a className="brand" href="#" onClick={(event) => event.preventDefault()}><span className="brand-mark">H</span> HostelSplit</a><div className="nav-actions"><button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>{cloudSession ? <button className="btn secondary" onClick={handleLogout}>Sign out</button> : cloudConfigured ? <button className="btn secondary" onClick={() => { setLocalMode(false); setSession(getCachedSession()); }}>Log in / Sign up</button> : localProfile ? <><span className="user-chip">{localProfile.displayName}</span><button className="btn secondary" onClick={handleLocalLogout}>Sign out</button></> : <button className="btn secondary" onClick={() => { setShowLocalAuth(true); setError(""); }}>Log in / Create account</button>}</div></nav>
         <main className="welcome-shell">
           {!cloudConfigured && <div className="cloud-setup-banner"><div><strong>Cloud login is not connected yet</strong><span>This deployment is using browser-only storage. Add a dedicated Supabase project URL and publishable key, apply <code>supabase/schema.sql</code>, then redeploy to enable cloud accounts and cross-device sync.</span></div><a href="https://github.com/ayushydv1805/HostelSplit#enable-cloud-mode" target="_blank" rel="noreferrer">Cloud setup guide ↗</a></div>}
           <section className="welcome-copy"><span className="eyebrow">SMART HOSTEL EXPENSE SHARING</span><h1>Split expenses.<br /><span>Keep friendships.</span></h1><p>Know who paid, what everyone owes, and how to settle up with fewer payments. Now with custom splits, receipt scanning, budgets and downloadable reports.</p><div className="welcome-actions"><button className="btn primary large" onClick={() => { setShowGroupForm(true); setGroupNameInput(""); setError(""); }}>＋ Create a group</button><button className="btn secondary large" onClick={() => { setGroup({ id: "demo-" + makeId(), name: "Manali Trip", currency: "INR", monthly_budget: 12000, source: "local" }); const demoMembers = normalizeMembers(["Ayush", "Rahul", "Aman", "Ansh"]); setMembers(demoMembers); setExpenses([{ id: makeId(), name: "Hotel", amount: 4800, paidBy: "Ayush", category: "Hotel", splitType: "equal", date: today(), splits: [{ memberId: "Ayush", amount: 1200 }, { memberId: "Rahul", amount: 1200 }, { memberId: "Aman", amount: 1200 }, { memberId: "Ansh", amount: 1200 }] }, { id: makeId(), name: "Dinner", amount: 1850, paidBy: "Rahul", category: "Food", splitType: "equal", date: today(), splits: [{ memberId: "Ayush", amount: 462.5 }, { memberId: "Rahul", amount: 462.5 }, { memberId: "Aman", amount: 462.5 }, { memberId: "Ansh", amount: 462.5 }] }, { id: makeId(), name: "Taxi", amount: 1200, paidBy: "Aman", category: "Travel", splitType: "equal", date: today(), splits: [{ memberId: "Ayush", amount: 300 }, { memberId: "Rahul", amount: 300 }, { memberId: "Aman", amount: 300 }, { memberId: "Ansh", amount: 300 }] }]); setSettlements([]); setBudgets([]); setNotice("Demo loaded. Try adding an expense or exporting the report."); }}>Explore demo</button></div><div className="trust-row"><span>✓ Local-first privacy</span><span>✓ Minimum-payment settlement</span><span>✓ CSV + PDF reports</span></div></section>
@@ -1078,6 +1278,7 @@ function App() {
           <button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>
           {isCloud && <button className="btn secondary desktop-only" onClick={() => { setActiveGroupId(""); setGroup(null); setGroupListVersion((value) => value + 1); }}>All groups</button>}
           {isCloud && <button className="btn secondary desktop-only" onClick={handleLogout}>Sign out</button>}
+          {!isCloud && localProfile && <><span className="user-chip desktop-only">{localProfile.displayName}</span><button className="btn secondary" onClick={handleLocalLogout}>Sign out</button></>}
           <button className="btn secondary" onClick={clearGroup} disabled={busy}>{isCloud && !isGroupOwner ? "Leave group" : "Delete group"}</button>
         </div>
       </nav>
