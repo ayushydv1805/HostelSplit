@@ -1,430 +1,1188 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  callRpc,
+  clearCachedSession,
+  completePasswordRecovery,
+  cloudConfigured,
+  deleteRows,
+  getCachedSession,
+  getCurrentUser,
+  getReceiptUrl,
+  insertRows,
+  refreshSession,
+  requestPasswordReset,
+  selectRows,
+  signIn,
+  signOut,
+  signUp,
+  updateRows,
+  uploadReceipt,
+} from "./lib/supabaseRest.js";
+import { compressReceiptImage, fileToDataUrl, readReceipt } from "./lib/receiptOcr.js";
+import { printFinancialReport } from "./lib/reports.js";
+import { allocateSplits, calculateBalances, calculateSettlements, normalizeAmount } from "./lib/domain.js";
 import "./App.css";
 
-const STORAGE_KEY = "hostelsplit-data";
-const THEME_KEY = "hostelsplit-theme";
-const BACKUP_STORAGE_KEY = "hostelsplit-data-backup";
-const CATEGORIES = ["Food", "Travel", "Hotel", "Shopping", "Entertainment", "Other"];
-const CATEGORY_ICONS = { Food: "🍔", Travel: "🚕", Hotel: "🏨", Shopping: "🛍️", Entertainment: "🎬", Other: "📦" };
-
-const emptyExpense = { name: "", amount: "", paidBy: "", category: "Food", members: [] };
-
-function money(value) {
-  const numeric = Number(value);
-  const safeValue = Number.isFinite(numeric) ? numeric : 0;
-  return "₹" + safeValue.toLocaleString("en-IN", { maximumFractionDigits: 2 });
-}
+const LOCAL_KEY = "hostelsplit-v2";
+const LEGACY_KEY = "hostelsplit-data";
+const LEGACY_BACKUP_KEY = "hostelsplit-data-backup";
+const CATEGORIES = ["Food", "Travel", "Hotel", "Shopping", "Entertainment", "Utilities", "Supplies", "Other"];
+const CATEGORY_ICONS = {
+  Food: "🍔", Travel: "🚕", Hotel: "🏨", Shopping: "🛍️", Entertainment: "🎬",
+  Utilities: "💡", Supplies: "🧻", Other: "📦",
+};
+const today = () => {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return now.getFullYear() + "-" + month + "-" + day;
+};
 
 function makeId() {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
 }
 
-function loadSavedData() {
+function money(value, currency) {
+  const amount = Number.isFinite(Number(value)) ? Number(value) : 0;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+    return new Intl.NumberFormat("en-IN", {
+      style: "currency",
+      currency: currency || "INR",
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    return "₹" + amount.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+  }
+}
 
-    const members = [];
-    const seenMembers = new Set();
-    (Array.isArray(data.members) ? data.members : []).forEach((value) => {
-      if (typeof value !== "string") return;
+function normalizeMembers(rawMembers) {
+  const unique = new Set();
+  return (Array.isArray(rawMembers) ? rawMembers : []).map((value) => {
+    if (typeof value === "string") {
       const name = value.trim().replace(/\s+/g, " ");
-      const key = name.toLocaleLowerCase("en-IN");
-      if (name && !seenMembers.has(key)) {
-        seenMembers.add(key);
-        members.push(name);
-      }
+      return { id: name, name, role: "member" };
+    }
+    if (!value || typeof value !== "object") return null;
+    const name = String(value.display_name || value.name || "").trim().replace(/\s+/g, " ");
+    const id = String(value.user_id || value.id || name).trim();
+    return name && id ? { id, name, role: value.role || "member" } : null;
+  }).filter((member) => {
+    if (!member) return false;
+    const key = member.id.toLowerCase();
+    if (unique.has(key)) return false;
+    unique.add(key);
+    return true;
+  });
+}
+
+function normalizeExpense(raw, members) {
+  if (!raw || typeof raw !== "object") return null;
+  const amount = normalizeAmount(raw.amount);
+  const memberIds = new Set(members.map((member) => member.id));
+  const name = String(raw.name || "").trim();
+  const paidBy = String(raw.paidBy || raw.paid_by || "");
+  let splits = Array.isArray(raw.splits) ? raw.splits : [];
+  if (!splits.length && Array.isArray(raw.members) && raw.members.length) {
+    const ids = raw.members.map((member) => typeof member === "string" ? member : member.id).filter((id) => memberIds.has(id));
+    if (amount !== null && ids.length) {
+      const cents = Math.round(amount * 100);
+      splits = ids.map((memberId, index) => ({
+        memberId,
+        amount: Math.floor(cents / ids.length) / 100 + (index < cents % ids.length ? 0.01 : 0),
+      }));
+    }
+  }
+  splits = splits.filter((split) => split && memberIds.has(String(split.memberId || split.user_id || "")))
+    .map((split) => {
+      const rawShare = Number(split.amount != null ? split.amount : split.share_amount);
+      if (!Number.isFinite(rawShare) || rawShare < 0 || !Number.isSafeInteger(Math.round(rawShare * 100))) return null;
+      return {
+        memberId: String(split.memberId || split.user_id),
+        amount: Math.round(rawShare * 100) / 100,
+      };
     });
+  if (splits.some((split) => !split)) return null;
+  const splitTotalCents = splits.reduce((sum, split) => sum + Math.round(split.amount * 100), 0);
+  if (!name || amount === null || !memberIds.has(paidBy) || splits.length === 0 || splitTotalCents !== Math.round(amount * 100)) return null;
+  return {
+    id: String(raw.id || makeId()),
+    name,
+    amount,
+    paidBy,
+    category: CATEGORIES.includes(raw.category) ? raw.category : "Other",
+    splitType: ["equal", "exact", "percentage"].includes(raw.splitType || raw.split_type) ? (raw.splitType || raw.split_type) : "equal",
+    date: String(raw.date || raw.expense_date || today()).slice(0, 10),
+    splits,
+    receiptDataUrl: raw.receiptDataUrl || "",
+    receiptPath: raw.receiptPath || raw.receipt_path || "",
+    receiptText: raw.receiptText || raw.receipt_text || "",
+    createdAt: raw.createdAt || raw.created_at || new Date().toISOString(),
+  };
+}
 
-    const canonicalMember = (value) => {
-      if (typeof value !== "string") return "";
-      return members.find((member) => member.toLocaleLowerCase("en-IN") === value.trim().toLocaleLowerCase("en-IN")) || "";
-    };
+function loadLocalData() {
+  try {
+    let saved = localStorage.getItem(LOCAL_KEY);
+    if (!saved) {
+      const legacy = localStorage.getItem(LEGACY_KEY) || localStorage.getItem(LEGACY_BACKUP_KEY);
+      if (legacy) {
+        const old = JSON.parse(legacy);
+        const oldMembers = normalizeMembers(old.members);
+        const migrated = {
+          group: old.groupName ? { id: "local-" + makeId(), name: old.groupName, currency: "INR", monthly_budget: 0, source: "local" } : null,
+          members: oldMembers,
+          expenses: (old.expenses || []).map((expense) => normalizeExpense({
+            ...expense,
+            paidBy: expense.paidBy,
 
-    const expenses = (Array.isArray(data.expenses) ? data.expenses : [])
-      .filter((expense) => expense && typeof expense === "object" && !Array.isArray(expense))
-      .map((expense) => {
-        const amount = Number(expense.amount);
-        const splitMembers = [];
-        (Array.isArray(expense.members) ? expense.members : []).forEach((value) => {
-          const member = canonicalMember(value);
-          if (member && !splitMembers.includes(member)) splitMembers.push(member);
-        });
-        return {
-          id: typeof expense.id === "string" && expense.id ? expense.id : makeId(),
-          name: typeof expense.name === "string" ? expense.name.trim() : "",
-          amount,
-          paidBy: canonicalMember(expense.paidBy),
-          category: CATEGORIES.includes(expense.category) ? expense.category : "Other",
-          members: splitMembers,
+          }, oldMembers)).filter(Boolean),
+          settlements: [],
+          budgets: [],
         };
-      })
-      .filter((expense) => expense.name && Number.isFinite(expense.amount) && Number.isSafeInteger(Math.round(expense.amount * 100)) && Math.round(expense.amount * 100) > 0 && expense.paidBy && expense.members.length > 0);
-
+        localStorage.setItem(LOCAL_KEY, JSON.stringify(migrated));
+        return migrated;
+      }
+      return { group: null, members: [], expenses: [], settlements: [], budgets: [] };
+    }
+    const data = JSON.parse(saved);
+    const members = normalizeMembers(data.members);
     return {
-      groupName: typeof data.groupName === "string" ? data.groupName.trim() : "",
+      group: data.group && typeof data.group.name === "string" ? { ...data.group, source: "local" } : null,
       members,
-      expenses,
-      paidSettlements: Array.isArray(data.paidSettlements) ? data.paidSettlements.filter((item) => typeof item === "string") : [],
+      expenses: (Array.isArray(data.expenses) ? data.expenses : []).map((expense) => normalizeExpense(expense, members)).filter(Boolean),
+      settlements: Array.isArray(data.settlements) ? data.settlements : [],
+      budgets: Array.isArray(data.budgets) ? data.budgets : [],
     };
   } catch {
-    return null;
+    return { group: null, members: [], expenses: [], settlements: [], budgets: [] };
   }
 }
 
-function loadTheme() {
-  try {
-    return localStorage.getItem(THEME_KEY) === "dark";
-  } catch {
-    return false;
-  }
+function firstError(error, fallback) {
+  return error && error.message ? error.message : fallback;
+}
+
+function AuthScreen({ onBack, onComplete }) {
+  const [view, setView] = useState(() => {
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    return params.get("type") === "recovery" ? "changePassword" : "signin";
+  });
+  const [recoveryToken, setRecoveryToken] = useState(() => {
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    return params.get("type") === "recovery" ? params.get("access_token") || "" : "";
+  });
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setError("");
+    setNotice("");
+    if (view !== "reset" && password.length < 8) {
+      setError("Use a password with at least 8 characters.");
+      return;
+    }
+    if (view === "changePassword" && password !== confirmPassword) {
+      setError("The passwords do not match.");
+      return;
+    }
+    if (view === "changePassword" && !recoveryToken) {
+      setError("This recovery link is missing its token. Request a new password-reset email.");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (view === "signin") {
+        const session = await signIn(email, password);
+        const user = await getCurrentUser(session);
+        onComplete(session, user);
+      } else if (view === "signup") {
+        if (!displayName.trim()) throw new Error("Enter your name.");
+        const result = await signUp(email, password, displayName);
+        if (result.session) {
+          const user = await getCurrentUser(result.session);
+          onComplete(result.session, user);
+        } else {
+          setNotice("Account created. Check your email to confirm your address, then sign in.");
+          setView("signin");
+        }
+      } else if (view === "reset") {
+        await requestPasswordReset(email);
+        setNotice("If the account exists, Supabase will send a password-reset email.");
+        setView("signin");
+      } else {
+        await completePasswordRecovery(recoveryToken, password);
+        window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+        setRecoveryToken("");
+        setPassword("");
+        setConfirmPassword("");
+        setView("signin");
+        setNotice("Password updated successfully. Sign in with your new password.");
+      }
+    } catch (caught) {
+      setError(firstError(caught, "Authentication failed. Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="auth-shell">
+      <nav className="navbar"><a className="brand" href="#" onClick={(event) => { event.preventDefault(); onBack(); }}><span className="brand-mark">H</span> HostelSplit</a><span className="live-pill"><span /> Secure cloud mode</span></nav>
+      <main className="auth-layout">
+        <section className="auth-story">
+          <span className="eyebrow">SHARED EXPENSES, LESS AWKWARDNESS</span>
+          <h1>Roommates on the same page.</h1>
+          <p>Keep group expenses, receipts, budgets and settlements synced across everyone’s devices.</p>
+          <div className="auth-points"><span>✓ Shared group access</span><span>✓ Flexible split rules</span><span>✓ Receipt and budget tracking</span></div>
+        </section>
+        <form className="auth-card" onSubmit={submit}>
+          <div className="auth-card-icon">✦</div>
+          <h2>{view === "signin" ? "Welcome back" : view === "signup" ? "Create your account" : view === "changePassword" ? "Choose a new password" : "Reset password"}</h2>
+          <p>{view === "signin" ? "Sign in to open your shared groups." : view === "signup" ? "Start a group with your hostel friends." : view === "changePassword" ? "Choose a new password for your account." : "We’ll email you a password reset link."}</p>
+          {view === "signup" && <label>Your name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="name" required placeholder="e.g. Ayush Yadav" /></label>}
+          {view !== "changePassword" && <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required placeholder="you@example.com" /></label>}
+          {view !== "reset" && <label>{view === "changePassword" ? "New password" : "Password"}<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={view === "signin" ? "current-password" : "new-password"} minLength={8} required placeholder="At least 8 characters" /></label>}
+          {view === "changePassword" && <label>Confirm new password<input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" minLength={8} required placeholder="Enter the new password again" /></label>}
+          {error && <div className="alert error">{error}</div>}
+          {notice && <div className="alert success">{notice}</div>}
+          <button className="btn primary full" type="submit" disabled={busy}>{busy ? "Please wait…" : view === "signin" ? "Sign in" : view === "signup" ? "Create account" : view === "changePassword" ? "Update password" : "Send reset link"}</button>
+          <div className="auth-links">
+            {view === "changePassword" ? <button type="button" onClick={() => { setView("signin"); setRecoveryToken(""); setPassword(""); setConfirmPassword(""); window.history.replaceState({}, document.title, window.location.pathname + window.location.search); }}>Back to sign in</button> : <>
+              {view === "signin" && <button type="button" onClick={() => { setView("reset"); setError(""); setNotice(""); }}>Forgot password?</button>}
+              <button type="button" onClick={() => { setView(view === "signup" ? "signin" : "signup"); setError(""); setNotice(""); }}>{view === "signup" ? "Already have an account? Sign in" : "New here? Create an account"}</button>
+            </>}
+          </div>
+          <button type="button" className="btn secondary full" onClick={onBack}>Continue offline instead</button>
+          <small className="muted tiny">Cloud access requires the database schema from supabase/schema.sql and valid Vite environment variables.</small>
+        </form>
+      </main>
+    </div>
+  );
+}
+
+function EmptyState({ icon, title, body, action }) {
+  return <div className="empty-state"><div className="empty-icon">{icon || "✦"}</div><h3>{title}</h3><p>{body}</p>{action}</div>;
 }
 
 function App() {
-  const [saved] = useState(loadSavedData);
-  const [groupName, setGroupName] = useState(saved?.groupName || "");
-  const [members, setMembers] = useState(saved?.members || []);
-  const [expenses, setExpenses] = useState(saved?.expenses || []);
-  const [paidSettlements, setPaidSettlements] = useState(saved?.paidSettlements || []);
-  const [darkMode, setDarkMode] = useState(loadTheme);
-  const [showCreate, setShowCreate] = useState(false);
-  const [showExpense, setShowExpense] = useState(false);
-  const [editingExpense, setEditingExpense] = useState(null);
-  const [newMember, setNewMember] = useState("");
-  const [searchExpense, setSearchExpense] = useState("");
-  const [expenseForm, setExpenseForm] = useState(emptyExpense);
+  const [initialLocal] = useState(loadLocalData);
+  const [localMode, setLocalMode] = useState(!cloudConfigured);
+  const [session, setSession] = useState(() => cloudConfigured ? getCachedSession() : null);
+  const [user, setUser] = useState(null);
+  const [cloudGroups, setCloudGroups] = useState([]);
+  const [activeGroupId, setActiveGroupId] = useState("");
+  const [group, setGroup] = useState(initialLocal.group);
+  const [members, setMembers] = useState(initialLocal.members);
+  const [expenses, setExpenses] = useState(initialLocal.expenses);
+  const [settlements, setSettlements] = useState(initialLocal.settlements || []);
+  const [budgets, setBudgets] = useState(initialLocal.budgets || []);
+  const [darkMode, setDarkMode] = useState(() => {
+    try { return localStorage.getItem("hostelsplit-theme") === "dark"; } catch { return false; }
+  });
+  const [loadingData, setLoadingData] = useState(false);
+  const [lastSyncAt, setLastSyncAt] = useState(null);
+  const [groupListVersion, setGroupListVersion] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [query, setQuery] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("All");
+  const [monthFilter, setMonthFilter] = useState(new Date().toISOString().slice(0, 7));
+  const [showGroupForm, setShowGroupForm] = useState(false);
+  const [groupNameInput, setGroupNameInput] = useState("");
+  const [groupCurrencyInput, setGroupCurrencyInput] = useState("INR");
+  const [initialMembersInput, setInitialMembersInput] = useState("");
+  const [inviteCodeInput, setInviteCodeInput] = useState("");
+  const [showExpenseForm, setShowExpenseForm] = useState(false);
+  const [editingExpenseId, setEditingExpenseId] = useState("");
+  const [showBudgetForm, setShowBudgetForm] = useState(false);
+  const [budgetInput, setBudgetInput] = useState("");
+  const [categoryBudgetName, setCategoryBudgetName] = useState("Food");
+  const [categoryBudgetInput, setCategoryBudgetInput] = useState("");
+  const [showMemberForm, setShowMemberForm] = useState(false);
+  const [memberInput, setMemberInput] = useState("");
+  const [receiptBusy, setReceiptBusy] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [expenseForm, setExpenseForm] = useState({
+    name: "", amount: "", paidBy: "", category: "Food", date: today(),
+    splitType: "equal", selectedMembers: [], splitValues: {},
+    receiptFile: null, receiptDataUrl: "", receiptPath: "", receiptText: "", suggestedAmount: null,
+  });
 
-  const groupCreated = Boolean(groupName.trim() && members.length >= 2);
+  const hasSession = Boolean(session);
+  const cloudSession = cloudConfigured && !localMode && Boolean(session && user);
+  const isCloud = cloudSession && Boolean(group && group.source === "cloud");
 
   useEffect(() => {
     try {
-      localStorage.setItem(THEME_KEY, darkMode ? "dark" : "light");
+      localStorage.setItem("hostelsplit-theme", darkMode ? "dark" : "light");
       document.documentElement.dataset.theme = darkMode ? "dark" : "light";
     } catch {
-      // Theme preference is optional when browser storage is blocked.
+      // Theme preference is optional.
     }
   }, [darkMode]);
 
   useEffect(() => {
-    if (!groupCreated) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ groupName, members, expenses, paidSettlements }));
-    } catch {
-      // The app remains usable if storage is full or disabled.
-    }
-  }, [groupCreated, groupName, members, expenses, paidSettlements]);
-
-  const totalSpent = useMemo(() => expenses.reduce((sum, e) => sum + Number(e.amount || 0), 0), [expenses]);
-
-  const balances = useMemo(() => {
-    const result = Object.fromEntries(members.map((member) => [member, { paid: 0, share: 0, balance: 0 }]));
-    expenses.forEach((expense) => {
-      const amount = Number(expense.amount || 0);
-      const splitMembers = Array.isArray(expense.members) ? expense.members.filter((m) => result[m]) : [];
-      if (!splitMembers.length) return;
-      if (result[expense.paidBy]) result[expense.paidBy].paid += amount;
-      const share = amount / splitMembers.length;
-      splitMembers.forEach((member) => { result[member].share += share; });
-    });
-    Object.values(result).forEach((item) => { item.balance = item.paid - item.share; });
-    return result;
-  }, [members, expenses]);
-
-  const settlements = useMemo(() => {
-    const debtors = Object.entries(balances).filter(([, b]) => b.balance < -0.005).map(([name, b]) => ({ name, amount: -b.balance }));
-    const creditors = Object.entries(balances).filter(([, b]) => b.balance > 0.005).map(([name, b]) => ({ name, amount: b.balance }));
-    const result = [];
-    let i = 0;
-    let j = 0;
-    while (i < debtors.length && j < creditors.length) {
-      const amount = Math.min(debtors[i].amount, creditors[j].amount);
-      result.push({ from: debtors[i].name, to: creditors[j].name, amount: Math.round(amount * 100) / 100 });
-      debtors[i].amount -= amount;
-      creditors[j].amount -= amount;
-      if (debtors[i].amount < 0.005) i += 1;
-      if (creditors[j].amount < 0.005) j += 1;
-    }
-    return result;
-  }, [balances]);
-
-  const categoryTotals = useMemo(() => {
-    const totals = {};
-    expenses.forEach((expense) => {
-      const category = expense.category || "Other";
-      totals[category] = (totals[category] || 0) + Number(expense.amount || 0);
-    });
-    return totals;
-  }, [expenses]);
-
-  const filteredExpenses = useMemo(() => {
-    const query = searchExpense.trim().toLowerCase();
-    return expenses
-      .map((expense, index) => ({ expense, index }))
-      .filter(({ expense }) => !query || `${expense.name} ${expense.category} ${expense.paidBy}`.toLowerCase().includes(query));
-  }, [expenses, searchExpense]);
-
-  const openNewExpense = () => {
-    setExpenseForm({ ...emptyExpense, paidBy: members[0] || "", members: [...members] });
-    setShowExpense(true);
-  };
-
-  const toggleSplitMember = (member) => {
-    setExpenseForm((current) => ({
-      ...current,
-      members: current.members.includes(member) ? current.members.filter((m) => m !== member) : [...current.members, member],
-    }));
-  };
-
-  const saveExpense = () => {
-    const amount = Number(expenseForm.amount);
-    const validPayer = members.includes(expenseForm.paidBy);
-    const validSplitMembers = Array.isArray(expenseForm.members) && expenseForm.members.length > 0 && expenseForm.members.every((member) => members.includes(member));
-    if (!expenseForm.name.trim() || !Number.isFinite(amount) || !Number.isSafeInteger(Math.round(amount * 100)) || Math.round(amount * 100) <= 0 || !validPayer || !validSplitMembers) {
-      window.alert("Enter an expense name, a valid positive amount, a group member who paid, and at least one valid person to split with.");
-      return;
-    }
-    const expense = {
-      id: makeId(),
-      name: expenseForm.name.trim(),
-      amount: Math.round(amount * 100) / 100,
-      paidBy: expenseForm.paidBy,
-      category: CATEGORIES.includes(expenseForm.category) ? expenseForm.category : "Other",
-      members: [...new Set(expenseForm.members)],
+    if (localMode || !cloudConfigured || !hasSession) return undefined;
+    let active = true;
+    const verifySession = async () => {
+      try {
+        const refreshed = await refreshSession();
+        if (active) setSession(refreshed);
+        if (refreshed && active) {
+          const currentUser = await getCurrentUser(refreshed);
+          if (active) setUser(currentUser);
+        } else if (active) {
+          setUser(null);
+        }
+      } catch (caught) {
+        if (active) {
+          clearCachedSession();
+          setSession(null);
+          setUser(null);
+          setError("Your cloud session expired. Please sign in again. " + firstError(caught, ""));
+        }
+      }
     };
-    setExpenses((current) => [...current, expense]);
-    setPaidSettlements([]);
-    setExpenseForm(emptyExpense);
-    setShowExpense(false);
+    verifySession();
+    return () => { active = false; };
+  }, [localMode, hasSession]);
+
+  useEffect(() => {
+    if (!cloudSession) return undefined;
+    let active = true;
+    const loadGroups = async () => {
+      setLoadingData(true);
+      try {
+        const rows = await selectRows("groups", {
+          select: "id,name,invite_code,currency,monthly_budget,created_by,created_at",
+          order: "created_at.desc",
+        }, session);
+        if (!active) return;
+        setCloudGroups(Array.isArray(rows) ? rows : []);
+        setActiveGroupId((current) => current && rows.some((item) => item.id === current) ? current : "");
+      } catch (caught) {
+        if (active) setError("Could not load shared groups: " + firstError(caught, "Check the SQL schema and Supabase API settings."));
+      } finally {
+        if (active) setLoadingData(false);
+      }
+    };
+    loadGroups();
+    return () => { active = false; };
+  }, [cloudSession, session, groupListVersion]);
+
+  const activeMonthStart = (monthFilter || new Date().toISOString().slice(0, 7)) + "-01";
+  const loadCloudData = useCallback(async (groupId, activeSession, options = {}) => {
+    if (!groupId || !activeSession) return;
+    const silent = Boolean(options.silent);
+    if (!silent) setLoadingData(true);
+    if (!silent) setError("");
+    try {
+      const selectedGroups = await selectRows("groups", {
+        select: "id,name,invite_code,currency,monthly_budget,created_by,created_at",
+        id: "eq." + groupId,
+      }, activeSession);
+      if (!selectedGroups || !selectedGroups[0]) throw new Error("That group is no longer available to this account.");
+      const loadedGroup = { ...selectedGroups[0], source: "cloud" };
+      const [memberRows, expenseRows, settlementRows, budgetRows] = await Promise.all([
+        selectRows("group_members", { select: "user_id,display_name,role,joined_at", group_id: "eq." + groupId, order: "joined_at.asc" }, activeSession),
+        selectRows("expenses", { select: "*,expense_splits(user_id,share_amount)", group_id: "eq." + groupId, order: "expense_date.desc,created_at.desc" }, activeSession),
+        selectRows("settlements", { select: "*", group_id: "eq." + groupId, order: "created_at.desc" }, activeSession),
+        selectRows("budgets", { select: "*", group_id: "eq." + groupId, order: "month.desc" }, activeSession),
+      ]);
+      const loadedMembers = normalizeMembers(memberRows);
+      const loadedExpenses = (expenseRows || []).map((expense) => normalizeExpense({
+        ...expense,
+        paidBy: expense.paid_by,
+        date: expense.expense_date,
+        splitType: expense.split_type,
+        receiptPath: expense.receipt_path,
+        receiptText: expense.receipt_text,
+        splits: (expense.expense_splits || []).map((split) => ({ memberId: split.user_id, amount: Number(split.share_amount) })),
+      }, loadedMembers)).filter(Boolean);
+      const loadedSettlements = (settlementRows || []).map((settlement) => ({
+        id: settlement.id,
+        from: settlement.from_user,
+        to: settlement.to_user,
+        amount: Number(settlement.amount),
+        status: settlement.status,
+        note: settlement.note || "",
+        date: settlement.paid_at || settlement.created_at,
+        createdAt: settlement.created_at,
+      }));
+      setGroup(loadedGroup);
+      setMembers(loadedMembers);
+      setExpenses(loadedExpenses);
+      setSettlements(loadedSettlements);
+      setBudgets(Array.isArray(budgetRows) ? budgetRows : []);
+      setActiveGroupId(groupId);
+      setLastSyncAt(new Date().toISOString());
+    } catch (caught) {
+      if (!silent) setError("Could not load this group: " + firstError(caught, "Check Supabase schema, table exposure and row-level security."));
+    } finally {
+      if (!silent) setLoadingData(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!cloudSession || !activeGroupId || !session) return undefined;
+    let active = true;
+    const load = async () => {
+      await loadCloudData(activeGroupId, session);
+      if (!active) return;
+    };
+    load();
+    return () => { active = false; };
+  }, [cloudSession, activeGroupId, session, loadCloudData]);
+
+  useEffect(() => {
+    if (!cloudSession || !activeGroupId || !session) return undefined;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible" || busy || showExpenseForm || showBudgetForm || showGroupForm) return;
+      loadCloudData(activeGroupId, session, { silent: true });
+    }, 20000);
+    return () => window.clearInterval(timer);
+  }, [cloudSession, activeGroupId, session, loadCloudData, busy, showExpenseForm, showBudgetForm, showGroupForm]);
+
+  useEffect(() => {
+    if (isCloud || !group || group.source === "cloud") return;
+    const snapshot = { group, members, expenses, settlements, budgets };
+    try {
+      localStorage.setItem(LOCAL_KEY, JSON.stringify(snapshot));
+      // Keep old backup data out of the new storage path; Clear Group removes both.
+    } catch {
+      window.setTimeout(() => setError("Browser storage is full. Export your expenses and remove a receipt image or large browser data before continuing."), 0);
+    }
+  }, [isCloud, group, members, expenses, settlements, budgets]);
+
+  const balances = useMemo(() => calculateBalances(members, expenses, settlements), [members, expenses, settlements]);
+  const recommendedSettlements = useMemo(() => calculateSettlements(balances), [balances]);
+  const currency = group && group.currency ? group.currency : "INR";
+  const totalSpent = useMemo(() => expenses.reduce((sum, expense) => sum + expense.amount, 0), [expenses]);
+  const monthlyExpenses = useMemo(() => monthFilter ? expenses.filter((expense) => String(expense.date).slice(0, 7) === monthFilter) : expenses, [expenses, monthFilter]);
+  const monthlyTotal = useMemo(() => monthlyExpenses.reduce((sum, expense) => sum + expense.amount, 0), [monthlyExpenses]);
+  const categoryTotals = useMemo(() => {
+    const result = {};
+    expenses.forEach((expense) => { result[expense.category] = (result[expense.category] || 0) + expense.amount; });
+    return result;
+  }, [expenses]);
+  const monthlyCategoryTotals = useMemo(() => {
+    const result = {};
+    monthlyExpenses.forEach((expense) => { result[expense.category] = (result[expense.category] || 0) + expense.amount; });
+    return result;
+  }, [monthlyExpenses]);
+  const overallBudgetRecord = budgets.find((item) => item.category === "All" && item.month === activeMonthStart);
+  const overallBudget = overallBudgetRecord ? Number(overallBudgetRecord.amount || 0) : 0;
+  const selectedCategoryBudget = budgets.find((item) => item.category === categoryBudgetName && item.month === activeMonthStart);
+  const isGroupOwner = !isCloud || Boolean(user && (group.created_by === user.id || members.some((member) => member.id === user.id && member.role === "owner")));
+  const filteredExpenses = useMemo(() => {
+    const search = query.trim().toLowerCase();
+    return expenses.filter((expense) => {
+      const member = members.find((item) => item.id === expense.paidBy);
+      const text = [expense.name, expense.category, member ? member.name : expense.paidBy, expense.receiptText].join(" ").toLowerCase();
+      const matchSearch = !search || text.includes(search);
+      const matchCategory = categoryFilter === "All" || expense.category === categoryFilter;
+      const matchMonth = !monthFilter || String(expense.date).slice(0, 7) === monthFilter;
+      return matchSearch && matchCategory && matchMonth;
+    });
+  }, [expenses, members, query, categoryFilter, monthFilter]);
+
+  const settleCurrentGroup = () => {
+    setGroup(null);
+    setActiveGroupId("");
+    setMembers([]);
+    setExpenses([]);
+    setSettlements([]);
+    setBudgets([]);
   };
 
-  const openEdit = (expense) => {
-    setEditingExpense({ ...expense, amount: String(expense.amount), members: [...expense.members] });
+  const onAuthComplete = (newSession, newUser) => {
+    setLocalMode(false);
+    setSession(newSession);
+    setUser(newUser);
+    setGroup(null);
+    setMembers([]);
+    setExpenses([]);
+    setSettlements([]);
+    setBudgets([]);
+    setActiveGroupId("");
+    setError("");
+    setNotice("Signed in successfully.");
   };
 
-  const saveEdit = () => {
-    const amount = Number(editingExpense?.amount);
-    const validPayer = members.includes(editingExpense?.paidBy);
-    const validSplitMembers = Array.isArray(editingExpense?.members) && editingExpense.members.length > 0 && editingExpense.members.every((member) => members.includes(member));
-    if (!editingExpense || !editingExpense.name.trim() || !Number.isFinite(amount) || !Number.isSafeInteger(Math.round(amount * 100)) || Math.round(amount * 100) <= 0 || !validPayer || !validSplitMembers) {
-      window.alert("Please enter a name, a valid positive amount, a current group payer, and at least one valid person to split with.");
+  const handleLogout = async () => {
+    await signOut();
+    setSession(null);
+    setUser(null);
+    setCloudGroups([]);
+    setActiveGroupId("");
+    settleCurrentGroup();
+    setNotice("You have been signed out.");
+  };
+
+  const handleCreateGroup = async (event) => {
+    event.preventDefault();
+    const name = groupNameInput.trim();
+    if (!name) { setError("Enter a group name."); return; }
+    const parsedNames = initialMembersInput.split(",").map((item) => item.trim()).filter(Boolean);
+    if (!cloudSession && new Set(parsedNames.map((item) => item.toLowerCase())).size < 2) {
+      setError("Add at least two different members, separated by commas.");
       return;
     }
-    setExpenses((current) => current.map((expense) => expense.id === editingExpense.id ? {
-      ...editingExpense,
-      name: editingExpense.name.trim(),
-      amount: Math.round(amount * 100) / 100,
-      members: [...new Set(editingExpense.members)],
-    } : expense));
-    setPaidSettlements([]);
-    setEditingExpense(null);
+    setBusy(true);
+    setError("");
+    try {
+      if (cloudSession) {
+        const created = await insertRows("groups", [{
+          name,
+          created_by: user.id,
+          currency: groupCurrencyInput,
+          monthly_budget: 0,
+        }], session);
+        if (!created || !created[0]) throw new Error("The group was not created.");
+        await insertRows("group_members", [{
+          group_id: created[0].id,
+          user_id: user.id,
+          display_name: user.user_metadata && user.user_metadata.display_name ? user.user_metadata.display_name : String(user.email || "Owner").split("@")[0],
+          role: "owner",
+        }], session);
+        setShowGroupForm(false);
+        setGroupNameInput("");
+        setGroupCurrencyInput("INR");
+        await loadCloudGroupsAfterCreate(created[0].id);
+        setNotice("Group created. Share its invite code with other signed-in HostelSplit users.");
+      } else {
+        const localMembers = normalizeMembers([...new Set(parsedNames.map((item) => item.replace(/\s+/g, " ")))]);
+        setGroup({ id: "local-" + makeId(), name, currency: groupCurrencyInput, monthly_budget: 0, source: "local" });
+        setMembers(localMembers);
+        setExpenses([]);
+        setSettlements([]);
+        setBudgets([]);
+        setShowGroupForm(false);
+        setGroupNameInput("");
+        setGroupCurrencyInput("INR");
+        setInitialMembersInput("");
+        setNotice("Your local group is ready.");
+      }
+    } catch (caught) {
+      setError("Could not create the group: " + firstError(caught, "Please try again."));
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const deleteExpense = (id) => {
-    const expense = expenses.find((item) => item.id === id);
-    if (!expense || !window.confirm("Delete the expense \"" + expense.name + "\"?")) return;
-    setExpenses((current) => current.filter((item) => item.id !== id));
-    setPaidSettlements([]);
+  const loadCloudGroupsAfterCreate = async (createdId) => {
+    const rows = await selectRows("groups", {
+      select: "id,name,invite_code,currency,monthly_budget,created_by,created_at",
+      order: "created_at.desc",
+    }, session);
+    setCloudGroups(Array.isArray(rows) ? rows : []);
+    const selected = Array.isArray(rows) ? rows.find((item) => item.id === createdId) : null;
+    if (selected) {
+      setGroup({ ...selected, source: "cloud" });
+      setMembers([{ id: user.id, name: user.user_metadata && user.user_metadata.display_name ? user.user_metadata.display_name : String(user.email || "Owner").split("@")[0], role: "owner" }]);
+      setExpenses([]);
+      setSettlements([]);
+      setBudgets([]);
+    }
+    setActiveGroupId(createdId);
   };
 
-  const addMember = () => {
-    const name = newMember.trim().replace(/\s+/g, " ");
+  const handleJoinGroup = async (event) => {
+    event.preventDefault();
+    if (!inviteCodeInput.trim()) { setError("Enter your invite code."); return; }
+    setBusy(true);
+    setError("");
+    try {
+      const result = await callRpc("join_hostelsplit_group", { p_invite_code: inviteCodeInput.trim().toUpperCase() }, session);
+      const joinedId = Array.isArray(result) ? result[0] : result;
+      setInviteCodeInput("");
+      const rows = await selectRows("groups", { select: "id,name,invite_code,currency,monthly_budget,created_by,created_at", order: "created_at.desc" }, session);
+      setCloudGroups(Array.isArray(rows) ? rows : []);
+      setActiveGroupId(joinedId);
+      setNotice("You joined the group successfully.");
+    } catch (caught) {
+      setError("Could not join group: " + firstError(caught, "Check the code and try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeGroup = (id) => {
+    const selected = cloudGroups.find((item) => item.id === id);
+    if (selected) setGroup({ ...selected, source: "cloud" });
+    setMembers([]);
+    setExpenses([]);
+    setSettlements([]);
+    setBudgets([]);
+    setError("");
+    setNotice("");
+    setActiveGroupId(id);
+  };
+
+  const clearGroup = async () => {
+    const message = isCloud && !isGroupOwner
+      ? "Leave this group on this account? Its expenses and history will remain for the other members."
+      : "Delete this group and all its expenses, budgets and settlements? This cannot be undone.";
+    if (!window.confirm(message)) return;
+    setBusy(true);
+    try {
+      if (isCloud) {
+        if (isGroupOwner) {
+          await deleteRows("groups", { id: "eq." + group.id }, session);
+        } else {
+          await deleteRows("group_members", { group_id: "eq." + group.id, user_id: "eq." + user.id }, session);
+        }
+        setCloudGroups((current) => current.filter((item) => item.id !== group.id));
+        setActiveGroupId("");
+        settleCurrentGroup();
+      } else {
+        localStorage.removeItem(LOCAL_KEY);
+        localStorage.removeItem(LEGACY_KEY);
+        localStorage.removeItem(LEGACY_BACKUP_KEY);
+        settleCurrentGroup();
+      }
+      setNotice("Group deleted.");
+    } catch (caught) {
+      setError("Could not " + (isCloud && !isGroupOwner ? "leave this group: " : "delete this group: ") + firstError(caught, "Check your group permissions and try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openNewExpense = (expense) => {
+    if (expense) {
+      const values = {};
+      expense.splits.forEach((split) => {
+        values[split.memberId] = expense.splitType === "percentage"
+          ? String(Math.round(split.amount / expense.amount * 10000) / 100)
+          : String(split.amount);
+      });
+      setEditingExpenseId(expense.id);
+      setExpenseForm({
+        name: expense.name,
+        amount: String(expense.amount),
+        paidBy: expense.paidBy,
+        category: expense.category,
+        date: expense.date || today(),
+        splitType: expense.splitType || "equal",
+        selectedMembers: expense.splits.map((split) => split.memberId),
+        splitValues: values,
+        receiptFile: null,
+        receiptDataUrl: expense.receiptDataUrl || "",
+        receiptPath: expense.receiptPath || "",
+        receiptText: expense.receiptText || "",
+        suggestedAmount: null,
+      });
+    } else {
+      setEditingExpenseId("");
+      setExpenseForm({
+        name: "", amount: "", paidBy: members[0] ? members[0].id : "",
+        category: "Food", date: today(), splitType: "equal",
+        selectedMembers: members.map((member) => member.id),
+        splitValues: {}, receiptFile: null, receiptDataUrl: "", receiptPath: "", receiptText: "", suggestedAmount: null,
+      });
+    }
+    setShowExpenseForm(true);
+    setError("");
+  };
+
+  const toggleSplitMember = (memberId) => {
+    setExpenseForm((current) => {
+      const selected = current.selectedMembers.includes(memberId)
+        ? current.selectedMembers.filter((item) => item !== memberId)
+        : [...current.selectedMembers, memberId];
+      const values = { ...current.splitValues };
+      if (!selected.includes(memberId)) delete values[memberId];
+      return { ...current, selectedMembers: selected, splitValues: values };
+    });
+  };
+
+  const updateExpenseField = (field, value) => {
+    setExpenseForm((current) => ({ ...current, [field]: value }));
+  };
+
+  const handleReceipt = async (file) => {
+    if (!file) return;
+    setReceiptBusy(true);
+    setOcrProgress(0);
+    setError("");
+    try {
+      const compressed = await compressReceiptImage(file);
+      const dataUrl = await fileToDataUrl(compressed);
+      setExpenseForm((current) => ({ ...current, receiptFile: compressed, receiptDataUrl: dataUrl }));
+      try {
+        const extraction = await readReceipt(compressed, setOcrProgress);
+        setExpenseForm((current) => ({
+          ...current,
+          receiptFile: compressed,
+          receiptDataUrl: dataUrl,
+          receiptText: extraction.text,
+          suggestedAmount: extraction.suggestedAmount,
+          amount: current.amount || (extraction.suggestedAmount ? String(extraction.suggestedAmount) : ""),
+        }));
+        setNotice(extraction.suggestedAmount
+          ? "Receipt scanned. Suggested total: " + money(extraction.suggestedAmount, currency) + " — verify it before saving."
+          : "Receipt text extracted. Check it and enter the expense total manually.");
+      } catch (ocrError) {
+        setNotice("Receipt attached, but OCR could not read it: " + firstError(ocrError, "try a clearer image."));
+      }
+    } catch (caught) {
+      setError(firstError(caught, "Could not process the receipt."));
+    } finally {
+      setReceiptBusy(false);
+      setOcrProgress(0);
+    }
+  };
+
+  const handleSaveExpense = async (event) => {
+    event.preventDefault();
+    const amount = normalizeAmount(expenseForm.amount);
+    if (!expenseForm.name.trim() || amount === null || !members.some((member) => member.id === expenseForm.paidBy)) {
+      setError("Enter an expense name, valid positive amount, and a current group member who paid.");
+      return;
+    }
+    let splits;
+    try {
+      splits = allocateSplits(amount, expenseForm.selectedMembers, expenseForm.splitType, expenseForm.splitValues);
+    } catch (caught) {
+      setError(firstError(caught, "Check the split values."));
+      return;
+    }
+    if (splits.some((split) => !members.some((member) => member.id === split.memberId))) {
+      setError("A selected split member is no longer in this group.");
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    try {
+      let receiptPath = expenseForm.receiptPath || "";
+      if (isCloud && expenseForm.receiptFile) {
+        const safeName = makeId() + ".jpg";
+        receiptPath = user.id + "/" + group.id + "/" + safeName;
+        await uploadReceipt(receiptPath, expenseForm.receiptFile, session);
+      }
+      const expense = {
+        id: editingExpenseId || makeId(),
+        name: expenseForm.name.trim(),
+        amount,
+        paidBy: expenseForm.paidBy,
+        category: CATEGORIES.includes(expenseForm.category) ? expenseForm.category : "Other",
+        splitType: expenseForm.splitType,
+        date: expenseForm.date || today(),
+        splits,
+        receiptDataUrl: isCloud ? "" : expenseForm.receiptDataUrl,
+        receiptPath,
+        receiptText: expenseForm.receiptText || "",
+        createdAt: new Date().toISOString(),
+      };
+
+      if (isCloud) {
+        const payload = {
+          group_id: group.id,
+          name: expense.name,
+          amount: expense.amount,
+          paid_by: expense.paidBy,
+          category: expense.category,
+          split_type: expense.splitType,
+          expense_date: expense.date,
+          receipt_path: expense.receiptPath || null,
+          receipt_text: expense.receiptText || null,
+          created_by: user.id,
+        };
+        let expenseId = expense.id;
+        if (editingExpenseId) {
+          await updateRows("expenses", { id: "eq." + editingExpenseId }, payload, session);
+          await deleteRows("expense_splits", { expense_id: "eq." + editingExpenseId }, session);
+        } else {
+          const createdRows = await insertRows("expenses", [payload], session);
+          expenseId = createdRows && createdRows[0] ? createdRows[0].id : "";
+          if (!expenseId) throw new Error("The expense was saved without an ID. Reload the group and check it before trying again.");
+        }
+        await insertRows("expense_splits", splits.map((split) => ({
+          expense_id: expenseId,
+          user_id: split.memberId,
+          share_amount: split.amount,
+        })), session);
+        await loadCloudData(group.id, session);
+      } else {
+        setExpenses((current) => editingExpenseId
+          ? current.map((item) => item.id === editingExpenseId ? expense : item)
+          : [expense, ...current]);
+      }
+      setShowExpenseForm(false);
+      setEditingExpenseId("");
+      setNotice(editingExpenseId ? "Expense updated." : "Expense added.");
+    } catch (caught) {
+      setError("Could not save expense: " + firstError(caught, "Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteExpense = async (expense) => {
+    if (!window.confirm("Delete the expense “" + expense.name + "”?")) return;
+    setBusy(true);
+    try {
+      if (isCloud) {
+        await deleteRows("expenses", { id: "eq." + expense.id }, session);
+        await loadCloudData(group.id, session);
+      } else {
+        setExpenses((current) => current.filter((item) => item.id !== expense.id));
+      }
+      setNotice("Expense deleted.");
+    } catch (caught) {
+      setError("Could not delete the expense: " + firstError(caught, "Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const recordSettlement = async (settlement) => {
+    const payer = members.find((item) => item.id === settlement.from);
+    const receiver = members.find((item) => item.id === settlement.to);
+    if (!payer || !receiver) return;
+    setBusy(true);
+    try {
+      const entry = {
+        id: makeId(), from: settlement.from, to: settlement.to,
+        amount: settlement.amount, status: "paid", date: new Date().toISOString(),
+        note: "Marked paid from smart settlement",
+      };
+      if (isCloud) {
+        const rows = await insertRows("settlements", [{
+          group_id: group.id,
+          from_user: entry.from,
+          to_user: entry.to,
+          amount: entry.amount,
+          status: "paid",
+          paid_at: entry.date,
+          note: entry.note,
+          created_by: user.id,
+        }], session);
+        if (rows && rows[0]) entry.id = rows[0].id;
+      }
+      setSettlements((current) => [entry, ...current]);
+      setNotice(payer.name + " → " + receiver.name + " recorded as paid.");
+    } catch (caught) {
+      setError("Could not record settlement: " + firstError(caught, "Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const undoSettlement = async (settlement) => {
+    if (!window.confirm("Mark this settlement as cancelled? This changes the current balances but keeps the history.")) return;
+    setBusy(true);
+    try {
+      if (isCloud) {
+        await updateRows("settlements", { id: "eq." + settlement.id }, { status: "cancelled" }, session);
+      }
+      setSettlements((current) => current.map((item) => item.id === settlement.id ? { ...item, status: "cancelled" } : item));
+      setNotice("Settlement cancelled; balances recalculated.");
+    } catch (caught) {
+      setError("Could not update the settlement: " + firstError(caught, "Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveBudgets = async (event) => {
+    event.preventDefault();
+    const overall = Number(budgetInput || 0);
+    const categoryAmount = Number(categoryBudgetInput || 0);
+    if (!Number.isFinite(overall) || overall < 0 || !Number.isFinite(categoryAmount) || categoryAmount < 0) {
+      setError("Budgets must be valid non-negative amounts.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const monthDate = activeMonthStart;
+      if (isCloud) {
+        await updateRows("groups", { id: "eq." + group.id }, { monthly_budget: Math.round(overall * 100) / 100 }, session);
+        await insertRows("budgets", [
+          { group_id: group.id, month: monthDate, category: "All", amount: Math.round(overall * 100) / 100, created_by: user.id },
+          { group_id: group.id, month: monthDate, category: categoryBudgetName, amount: Math.round(categoryAmount * 100) / 100, created_by: user.id },
+        ], session, "group_id,month,category");
+        const rows = await selectRows("groups", { select: "id,name,invite_code,currency,monthly_budget,created_by,created_at", id: "eq." + group.id }, session);
+        if (rows && rows[0]) setGroup({ ...rows[0], source: "cloud" });
+        const budgetsData = await selectRows("budgets", { select: "*", group_id: "eq." + group.id, order: "month.desc" }, session);
+        setBudgets(budgetsData || []);
+      } else {
+        setGroup((current) => current ? { ...current, monthly_budget: Math.round(overall * 100) / 100 } : current);
+        setBudgets((current) => {
+          const withoutCurrent = current.filter((item) => !(item.month === monthDate && (item.category === "All" || item.category === categoryBudgetName)));
+          return [...withoutCurrent,
+            { id: makeId(), month: monthDate, category: "All", amount: Math.round(overall * 100) / 100 },
+            { id: makeId(), month: monthDate, category: categoryBudgetName, amount: Math.round(categoryAmount * 100) / 100 },
+          ];
+        });
+      }
+      setShowBudgetForm(false);
+      setNotice("Budgets saved for " + monthFilter + ".");
+    } catch (caught) {
+      setError("Could not save budgets: " + firstError(caught, "Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addMember = async (event) => {
+    event.preventDefault();
+    const name = memberInput.trim().replace(/\s+/g, " ");
     if (!name) return;
-    if (members.some((member) => member.toLowerCase() === name.toLowerCase())) {
-      window.alert("That member is already in the group.");
+    if (members.some((member) => member.name.toLowerCase() === name.toLowerCase())) {
+      setError("That member already exists.");
       return;
     }
-    setMembers((current) => [...current, name]);
-    setNewMember("");
+    if (isCloud) {
+      setError("Shared cloud groups only include users who sign in and join with the group's invite code. Share the code below instead.");
+      return;
+    }
+    setMembers((current) => [...current, { id: name, name, role: "member" }]);
+    setMemberInput("");
+    setShowMemberForm(false);
   };
 
-  const removeMember = (member) => {
-    if (groupCreated && members.length <= 2) {
-      window.alert("A group must keep at least 2 members. Add another member before removing this one.");
-      return;
-    }
-    if (expenses.some((expense) => expense.paidBy === member || expense.members.includes(member))) {
-      window.alert("This member is used by an existing expense. Delete or edit those expenses first.");
-      return;
-    }
-    setMembers((current) => current.filter((item) => item !== member));
-  };
-
-  const createGroup = () => {
-    if (!groupName.trim() || members.length < 2) {
-      window.alert("Add a group name and at least 2 members.");
-      return;
-    }
-    setGroupName(groupName.trim());
-    setShowCreate(false);
-  };
-
-  const clearGroup = () => {
-    if (!window.confirm("Delete this group and all its expenses? This cannot be undone.")) return;
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(BACKUP_STORAGE_KEY);
-    } catch {
-      window.alert("Browser storage could not be cleared. Please check your browser privacy settings.");
-      return;
-    }
-    setGroupName("");
-    setMembers([]);
-    setExpenses([]);
-    setPaidSettlements([]);
-    setSearchExpense("");
-  };
-
-  const beginNewGroup = () => {
-    if (!window.confirm("Start a new group? This replaces the current group and deletes its saved data. Export your expenses first if you need a copy.")) return;
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(BACKUP_STORAGE_KEY);
-    } catch {
-      window.alert("Browser storage could not be cleared. Please check your browser privacy settings.");
-      return;
-    }
-    setGroupName("");
-    setMembers([]);
-    setExpenses([]);
-    setPaidSettlements([]);
-    setSearchExpense("");
-    setNewMember("");
-    setShowCreate(true);
-  };
-
-  const settlementKey = (settlement) => `${settlement.from}|${settlement.to}|${settlement.amount.toFixed(2)}`;
-  const togglePaid = (settlement) => {
-    const key = settlementKey(settlement);
-    setPaidSettlements((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]);
-  };
-
-  const exportExpensesCsv = () => {
-    if (!expenses.length) {
-      window.alert("Add at least one expense before exporting.");
-      return;
-    }
-    const escapeCsv = (value) => '"' + String(value ?? "").replace(/"/g, '""') + '"';
+  const exportCsv = () => {
+    if (!expenses.length) { setError("Add an expense before exporting."); return; }
+    const escape = (value) => {
+      let cell = String(value == null ? "" : value);
+      if (/^\\s*[=+@-]/.test(cell)) cell = "'" + cell;
+      return '"' + cell.replace(/"/g, '""') + '"';
+    };
     const rows = [
-      ["Expense", "Amount (INR)", "Paid By", "Category", "Split Members"],
-      ...expenses.map((expense) => [expense.name, Number(expense.amount).toFixed(2), expense.paidBy, expense.category, expense.members.join(", ")])
+      ["Date", "Expense", "Amount", "Currency", "Paid by", "Category", "Split type", "Split member", "Share", "Receipt OCR text"],
     ];
-    const csv = "\uFEFF" + rows.map((row) => row.map(escapeCsv).join(",")).join("\r\n");
+    expenses.forEach((expense) => {
+      const payer = members.find((member) => member.id === expense.paidBy);
+      expense.splits.forEach((split) => {
+        const member = members.find((item) => item.id === split.memberId);
+        rows.push([expense.date, expense.name, expense.amount, currency, payer ? payer.name : expense.paidBy, expense.category, expense.splitType, member ? member.name : split.memberId, split.amount, expense.receiptText]);
+      });
+    });
+    const csv = "\uFEFF" + rows.map((row) => row.map(escape).join(",")).join("\r\n");
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
     const link = document.createElement("a");
     link.href = url;
-    link.download = (groupName || "hostelsplit").replace(/[^a-z0-9-_]+/gi, "-").toLowerCase() + "-expenses.csv";
+    link.download = (group.name || "hostelsplit").replace(/[^a-z0-9-_]+/gi, "-").toLowerCase() + "-expenses.csv";
     document.body.appendChild(link);
     link.click();
     link.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-
-  const startDemo = () => {
-    setGroupName("Manali Trip");
-    setMembers(["Ayush", "Rahul", "Aman", "Ansh"]);
-    setExpenses([
-      { id: makeId(), name: "Hotel", amount: 4800, paidBy: "Ayush", category: "Hotel", members: ["Ayush", "Rahul", "Aman", "Ansh"] },
-      { id: makeId(), name: "Dinner", amount: 1850, paidBy: "Rahul", category: "Food", members: ["Ayush", "Rahul", "Aman", "Ansh"] },
-      { id: makeId(), name: "Taxi", amount: 1200, paidBy: "Aman", category: "Travel", members: ["Ayush", "Rahul", "Aman", "Ansh"] },
-      { id: makeId(), name: "Tickets", amount: 600, paidBy: "Ansh", category: "Entertainment", members: ["Ayush", "Rahul", "Ansh"] },
-    ]);
-    setPaidSettlements([]);
+  const openReceipt = async (expense) => {
+    if (expense.receiptDataUrl) {
+      window.open(expense.receiptDataUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    if (isCloud && expense.receiptPath) {
+      try {
+        const url = await getReceiptUrl(expense.receiptPath, session);
+        window.open(url, "_blank", "noopener,noreferrer");
+      } catch (caught) {
+        setError("Could not open receipt: " + firstError(caught, "Please try again."));
+      }
+      return;
+    }
+    setError("This receipt is not available in this browser.");
   };
 
-  if (groupCreated) {
-    const paidCount = settlements.filter((s) => paidSettlements.includes(settlementKey(s))).length;
+  const exportPdf = () => {
+    try {
+      const reportExpenses = expenses.filter((expense) => !monthFilter || expense.date.slice(0, 7) === monthFilter);
+      const reportSettlements = settlements.filter((item) => item.status === "paid" && (!monthFilter || String(item.date || item.createdAt || "").slice(0, 7) === monthFilter));
+      const reportBalances = calculateBalances(members, reportExpenses, reportSettlements);
+      printFinancialReport({
+        groupName: group ? group.name : "HostelSplit",
+        members,
+        expenses: reportExpenses,
+        balances: reportBalances,
+        settlements: calculateSettlements(reportBalances),
+        budget: overallBudget,
+        month: monthFilter || "All months",
+      });
+    } catch (caught) {
+      setError(firstError(caught, "Could not open the report."));
+    }
+  };
+
+  const switchOffline = () => {
+    setLocalMode(true);
+    setSession(null);
+    setUser(null);
+    setActiveGroupId("");
+    setError("");
+    setNotice("Offline mode selected. Data is stored only in this browser.");
+  };
+
+  if (cloudConfigured && !localMode && (!session || !user)) {
+    return <AuthScreen onBack={switchOffline} onComplete={onAuthComplete} />;
+  }
+
+  if (cloudSession && !activeGroupId) {
     return (
-      <div className={`app dashboard-app ${darkMode ? "dark" : ""}`}>
-        <nav className="navbar">
-          <div className="brand-button"><span>💸</span> HostelSplit</div>
-          <div className="nav-actions">
-            <button className="icon-btn" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>
-            <button className="secondary-btn new-group-btn" onClick={beginNewGroup}>＋ New Group</button>
-            <button className="danger-btn" onClick={clearGroup}>🗑 Clear Group</button>
-          </div>
-        </nav>
-
-        <main className="dashboard-content">
-          <header className="dashboard-header">
-            <div><span className="badge">💰 YOUR GROUP</span><h1>{groupName}</h1><p>{members.length} members · {expenses.length} expenses</p></div>
-            <button className="primary-btn" onClick={openNewExpense}>＋ Add Expense</button>
-          </header>
-
-          <section className="stats-grid">
-            <div className="stat-card"><span>💰</span><small>Total Spent</small><h2>{money(totalSpent)}</h2></div>
-            <div className="stat-card"><span>👥</span><small>Members</small><h2>{members.length}</h2></div>
-            <div className="stat-card"><span>⚡</span><small>Pending Payments</small><h2>{Math.max(0, settlements.length - paidCount)}</h2></div>
-          </section>
-
-          <section className="two-column">
-            <div className="panel">
-              <div className="section-title"><div><h2>💰 Member Balances</h2><span>Live calculation</span></div></div>
-              {members.map((member) => {
-                const balance = balances[member] || { paid: 0, share: 0, balance: 0 };
-                return <div className="balance-item" key={member}>
-                  <div className="member-avatar">{member.charAt(0).toUpperCase()}</div>
-                  <div className="balance-info"><b>{member}</b><small>Paid {money(balance.paid)} · Share {money(balance.share)}</small></div>
-                  <strong className={balance.balance > 0.005 ? "positive" : balance.balance < -0.005 ? "negative" : "neutral"}>{balance.balance > 0.005 ? `Gets ${money(balance.balance)}` : balance.balance < -0.005 ? `Owes ${money(Math.abs(balance.balance))}` : "Settled"}</strong>
-                </div>;
-              })}
-            </div>
-
-            <div className="panel analytics-panel">
-              <div className="section-title"><div><h2>📊 Expense Analytics</h2><span>By category</span></div></div>
-              {totalSpent === 0 ? <div className="empty-state small"><div>📊</div><p>Add expenses to see your spending breakdown.</p></div> : <>
-                <div className="analytics-total"><small>Total spent</small><strong>{money(totalSpent)}</strong></div>
-                <div className="category-list">
-                  {Object.entries(categoryTotals).map(([category, amount]) => <div className="category-item" key={category}>
-                    <span className="category-icon">{CATEGORY_ICONS[category] || "📦"}</span><div className="category-info"><b>{category}</b><div className="progress-bar"><div className="progress-fill" style={{ width: `${Math.min(100, (amount / totalSpent) * 100)}%` }} /></div><small>{Math.round((amount / totalSpent) * 100)}%</small></div><strong>{money(amount)}</strong>
-                  </div>)}
-                </div>
-              </>}
-            </div>
-          </section>
-
-          {settlements.length > 0 && <section className="panel settlement-card">
-            <div className="section-title"><div><h2>⚡ Smart Settlement</h2><span>Minimum payments needed to settle everyone</span></div><span>{settlements.length} payments</span></div>
-            {settlements.map((settlement) => { const key = settlementKey(settlement); const paid = paidSettlements.includes(key); return <div className={`settlement-item ${paid ? "is-paid" : ""}`} key={key}>
-              <div className="settlement-person"><div className="member-avatar">{settlement.from[0]}</div><b>{settlement.from}</b></div><span className="arrow">→</span><div className="settlement-person"><div className="member-avatar">{settlement.to[0]}</div><b>{settlement.to}</b></div><strong>{money(settlement.amount)}</strong><button className="paid-btn" onClick={() => togglePaid(settlement)}>{paid ? "✓ Paid" : "Mark as Paid"}</button>
-            </div>; })}
-          </section>}
-
-          <section className="panel">
-            <div className="section-title expenses-title"><div><h2>🧾 Recent Expenses</h2><span>{expenses.length} expenses</span></div><div className="expense-tools"><button className="secondary-btn export-btn" onClick={exportExpensesCsv}>↓ Export CSV</button><input className="expense-search" value={searchExpense} onChange={(e) => setSearchExpense(e.target.value)} placeholder="🔎 Search expenses..." /></div></div>
-            {filteredExpenses.length === 0 ? <div className="empty-state"><div>🧾</div><h3>{expenses.length ? "No matching expenses" : "No expenses yet"}</h3><p>{expenses.length ? "Try another search." : "Add your first expense and HostelSplit will calculate everyone's share."}</p>{!expenses.length && <button className="primary-btn" onClick={openNewExpense}>＋ Add First Expense</button>}</div> : <div className="expense-list">
-              {filteredExpenses.map(({ expense }) => <div className="expense-item" key={expense.id}>
-                <div className="expense-icon">{CATEGORY_ICONS[expense.category] || "🧾"}</div><div className="expense-info"><b>{expense.name}</b><small>{expense.category} · {expense.paidBy} paid {money(expense.amount)}</small><small>Split between {expense.members.length} people</small></div><strong className="expense-amount">{money(expense.amount)}</strong><div className="expense-actions"><button className="ghost-btn" onClick={() => openEdit(expense)}>✏️ Edit</button><button className="ghost-btn danger-text" onClick={() => deleteExpense(expense.id)}>🗑 Delete</button></div>
-              </div>)}
-            </div>}
-          </section>
-
-          <section className="panel members-panel"><div className="section-title"><div><h2>👥 Group Members</h2><span>Manage people in this group</span></div></div><div className="member-management">{members.map((member) => <div className="member-chip" key={member}><span>{member}</span><button onClick={() => removeMember(member)} aria-label={`Remove ${member}`}>×</button></div>)}</div></section>
+      <div className={"app " + (darkMode ? "dark" : "")}>
+        <nav className="navbar"><a className="brand" href="#" onClick={(event) => event.preventDefault()}><span className="brand-mark">H</span> HostelSplit</a><div className="nav-actions"><button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button><span className="user-chip">{user.email}</span><button className="btn secondary" onClick={handleLogout}>Sign out</button></div></nav>
+        <main className="page-shell">
+          <header className="page-heading"><div><span className="eyebrow">YOUR WORKSPACE</span><h1>Shared groups</h1><p>Choose a group or make a fresh one for your hostel room, trip or flat.</p></div><span className="secure-tag">☁ Synced with Supabase</span></header>
+          {error && <div className="alert error">{error}</div>}
+          {notice && <div className="alert success">{notice}</div>}
+          {loadingData ? <div className="loading-card">Loading your groups…</div> : <div className="groups-grid">
+            {cloudGroups.map((item) => <button className="group-tile" key={item.id} onClick={() => changeGroup(item.id)}><span className="group-tile-icon">⌂</span><strong>{item.name}</strong><small>Invite code: {item.invite_code}</small><span className="tile-arrow">Open group →</span></button>)}
+            <button className="group-tile create-tile" onClick={() => { setShowGroupForm(true); setError(""); }}><span className="group-tile-icon">＋</span><strong>Create a group</strong><small>Start tracking expenses together.</small><span className="tile-arrow">New workspace →</span></button>
+          </div>}
+          <form className="join-card" onSubmit={handleJoinGroup}><div><h2>Join with invite code</h2><p>Ask a group owner for the code, then join from your own account.</p></div><div className="join-controls"><input value={inviteCodeInput} onChange={(event) => setInviteCodeInput(event.target.value.toUpperCase())} placeholder="E.g. A1B2C3D4" maxLength={10} aria-label="Invite code" /><button className="btn primary" type="submit" disabled={busy}>Join group</button></div></form>
         </main>
-
-        {showExpense && <ExpenseModal form={expenseForm} setForm={setExpenseForm} members={members} onClose={() => setShowExpense(false)} onSave={saveExpense} toggleMember={toggleSplitMember} />}
-        {editingExpense && <ExpenseModal title="Edit Expense" form={editingExpense} setForm={setEditingExpense} members={members} onClose={() => setEditingExpense(null)} onSave={saveEdit} toggleMember={(member) => setEditingExpense((current) => ({ ...current, members: current.members.includes(member) ? current.members.filter((m) => m !== member) : [...current.members, member] }))} />}
+        {showGroupForm && <div className="modal-backdrop"><form className="modal" onSubmit={handleCreateGroup}><button type="button" className="close-button" onClick={() => setShowGroupForm(false)} aria-label="Close">×</button><span className="eyebrow">NEW WORKSPACE</span><h2>Create a shared group</h2><p>Friends can join from their own accounts using a private invite code.</p><label>Group name<input value={groupNameInput} onChange={(event) => setGroupNameInput(event.target.value)} autoFocus required maxLength={100} placeholder="e.g. Hostel Room 603" /></label><label>Currency<select value={groupCurrencyInput} onChange={(event) => setGroupCurrencyInput(event.target.value)}><option value="INR">INR · Indian Rupee (₹)</option><option value="USD">USD · US Dollar ($)</option><option value="EUR">EUR · Euro (€)</option><option value="GBP">GBP · Pound Sterling (£)</option><option value="NPR">NPR · Nepalese Rupee (रू)</option><option value="CAD">CAD · Canadian Dollar (C$)</option><option value="AUD">AUD · Australian Dollar (A$)</option></select></label>{error && <div className="alert error">{error}</div>}<button className="btn primary full" disabled={busy}>{busy ? "Creating…" : "Create group"}</button></form></div>}
       </div>
     );
   }
 
+  if (!group) {
+    return (
+      <div className={"app " + (darkMode ? "dark" : "")}>
+        <nav className="navbar"><a className="brand" href="#" onClick={(event) => event.preventDefault()}><span className="brand-mark">H</span> HostelSplit</a><div className="nav-actions"><button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>{cloudSession ? <button className="btn secondary" onClick={handleLogout}>Sign out</button> : cloudConfigured && <button className="btn secondary" onClick={() => { setLocalMode(false); setSession(getCachedSession()); }}>Cloud login</button>}</div></nav>
+        <main className="welcome-shell">
+          {!cloudConfigured && <div className="cloud-setup-banner"><div><strong>Cloud login is not connected yet</strong><span>This deployment is using browser-only storage. Add a dedicated Supabase project URL and publishable key, apply <code>supabase/schema.sql</code>, then redeploy to enable cloud accounts and cross-device sync.</span></div><a href="https://github.com/ayushydv1805/HostelSplit#enable-cloud-mode" target="_blank" rel="noreferrer">Cloud setup guide ↗</a></div>}
+          <section className="welcome-copy"><span className="eyebrow">SMART HOSTEL EXPENSE SHARING</span><h1>Split expenses.<br /><span>Keep friendships.</span></h1><p>Know who paid, what everyone owes, and how to settle up with fewer payments. Now with custom splits, receipt scanning, budgets and downloadable reports.</p><div className="welcome-actions"><button className="btn primary large" onClick={() => { setShowGroupForm(true); setGroupNameInput(""); setError(""); }}>＋ Create a group</button><button className="btn secondary large" onClick={() => { setGroup({ id: "demo-" + makeId(), name: "Manali Trip", currency: "INR", monthly_budget: 12000, source: "local" }); const demoMembers = normalizeMembers(["Ayush", "Rahul", "Aman", "Ansh"]); setMembers(demoMembers); setExpenses([{ id: makeId(), name: "Hotel", amount: 4800, paidBy: "Ayush", category: "Hotel", splitType: "equal", date: today(), splits: [{ memberId: "Ayush", amount: 1200 }, { memberId: "Rahul", amount: 1200 }, { memberId: "Aman", amount: 1200 }, { memberId: "Ansh", amount: 1200 }] }, { id: makeId(), name: "Dinner", amount: 1850, paidBy: "Rahul", category: "Food", splitType: "equal", date: today(), splits: [{ memberId: "Ayush", amount: 462.5 }, { memberId: "Rahul", amount: 462.5 }, { memberId: "Aman", amount: 462.5 }, { memberId: "Ansh", amount: 462.5 }] }, { id: makeId(), name: "Taxi", amount: 1200, paidBy: "Aman", category: "Travel", splitType: "equal", date: today(), splits: [{ memberId: "Ayush", amount: 300 }, { memberId: "Rahul", amount: 300 }, { memberId: "Aman", amount: 300 }, { memberId: "Ansh", amount: 300 }] }]); setSettlements([]); setBudgets([]); setNotice("Demo loaded. Try adding an expense or exporting the report."); }}>Explore demo</button></div><div className="trust-row"><span>✓ Local-first privacy</span><span>✓ Minimum-payment settlement</span><span>✓ CSV + PDF reports</span></div></section>
+          <section className="welcome-visual"><div className="visual-top"><span className="visual-dot" /><span className="visual-dot" /><span className="visual-dot" /><span className="visual-label">GROUP OVERVIEW</span></div><div className="visual-total"><small>Trip expenses</small><strong>₹8,450</strong><span className="positive-text">● Tracked by category</span></div><div className="visual-bars"><span style={{ width: "78%" }} /><span style={{ width: "48%" }} /><span style={{ width: "29%" }} /></div><div className="visual-members"><span className="avatar">A</span><span className="avatar alt">R</span><span className="avatar yellow">A</span><span className="avatar green">A</span><div><strong>4 members</strong><small>One clear balance sheet</small></div></div><div className="visual-settle"><span>⚡</span><div><strong>Smart settlement</strong><small>Minimum transfers, less confusion</small></div><span className="settle-arrow">→</span></div></section>
+          <section className="feature-grid"><div><span>◎</span><h3>Flexible splits</h3><p>Equal shares, exact amounts or percentages.</p></div><div><span>▧</span><h3>Receipt scanner</h3><p>Attach an image and use OCR to suggest the total.</p></div><div><span>↗</span><h3>Budgets and reports</h3><p>Track monthly limits and export CSV or print-ready PDF.</p></div></section>
+        </main>
+        {error && <div className="floating-message error">{error}</div>}
+        {notice && <div className="floating-message success">{notice}</div>}
+        {showGroupForm && <div className="modal-backdrop"><form className="modal" onSubmit={handleCreateGroup}><button type="button" className="close-button" onClick={() => setShowGroupForm(false)} aria-label="Close">×</button><span className="eyebrow">NEW GROUP</span><h2>Create your group</h2><p>{cloudSession ? "A private invite code will be created so other users can join." : "Start a local group on this device. Add at least two members."}</p><label>Group name<input value={groupNameInput} onChange={(event) => setGroupNameInput(event.target.value)} required autoFocus maxLength={100} placeholder="e.g. Hostel Room 603" /></label><label>Currency<select value={groupCurrencyInput} onChange={(event) => setGroupCurrencyInput(event.target.value)}><option value="INR">INR · Indian Rupee (₹)</option><option value="USD">USD · US Dollar ($)</option><option value="EUR">EUR · Euro (€)</option><option value="GBP">GBP · Pound Sterling (£)</option><option value="NPR">NPR · Nepalese Rupee (रू)</option><option value="CAD">CAD · Canadian Dollar (C$)</option><option value="AUD">AUD · Australian Dollar (A$)</option></select></label>{!cloudSession && <label>Members, separated by commas<input value={initialMembersInput} onChange={(event) => setInitialMembersInput(event.target.value)} required placeholder="e.g. Ayush, Rahul, Aman" /></label>}{error && <div className="alert error">{error}</div>}<button className="btn primary full" disabled={busy}>{busy ? "Creating…" : "Create group"}</button></form></div>}
+      </div>
+    );
+  }
+
+  const pendingCount = recommendedSettlements.length;
+  const paidSettlementCount = settlements.filter((item) => item.status === "paid").length;
+  const monthlyBudgetUsage = overallBudget > 0 ? monthlyTotal / overallBudget * 100 : 0;
+
   return (
-    <div className={`app ${darkMode ? "dark" : ""}`}>
-      <nav className="navbar"><button className="brand-button"><span>💸</span> HostelSplit</button><button className="icon-btn" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button></nav>
-      <main className="hero">
-        <div className="hero-content"><span className="badge">✨ Smart Hostel Expense Sharing</span><h1>Split expenses.<br /><span>Stay friends.</span></h1><p>Track hostel, trip and daily group expenses, calculate fair shares and settle up with the minimum number of payments.</p><div className="buttons"><button className="primary-btn" onClick={() => setShowCreate(true)}>＋ Create New Group</button><button className="secondary-btn" onClick={startDemo}>▶ Explore Demo</button></div><div className="trust-row"><span>🔒 Browser-only data</span><span>⚡ Smart settlement</span><span>📊 Expense analytics</span></div></div>
-        <div className="hero-card"><div className="card-header"><div><small>TRIP EXPENSES</small><h2>Manali Trip 🏔️</h2></div><span className="members">4 members</span></div><div className="total"><small>Total spent</small><h2>{money(8450)}</h2></div><div className="demo-row"><span><b>Ayush</b><small>Paid ₹3,200</small></span><strong>₹3,200</strong></div><div className="demo-row"><span><b>Rahul</b><small>Paid ₹2,750</small></span><strong>₹2,750</strong></div><div className="demo-row"><span><b>Aman</b><small>Paid ₹2,500</small></span><strong>₹2,500</strong></div><div className="settlement-preview">⚡ <span>Smart Settlement</span><b>2 payments needed</b></div></div>
+    <div className={"app " + (darkMode ? "dark" : "")}>
+      <nav className="navbar">
+        <a className="brand" href="#" onClick={(event) => event.preventDefault()}><span className="brand-mark">H</span> HostelSplit</a>
+        <div className="nav-actions">
+          {isCloud && <span className="secure-tag desktop-only" title={lastSyncAt ? "Last synced " + new Date(lastSyncAt).toLocaleTimeString() : "Synced with Supabase"}>☁ Synced{lastSyncAt ? " · " + new Date(lastSyncAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</span>}
+          <button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>
+          {isCloud && <button className="btn secondary desktop-only" onClick={() => { setActiveGroupId(""); setGroup(null); setGroupListVersion((value) => value + 1); }}>All groups</button>}
+          {isCloud && <button className="btn secondary desktop-only" onClick={handleLogout}>Sign out</button>}
+          <button className="btn secondary" onClick={clearGroup} disabled={busy}>{isCloud && !isGroupOwner ? "Leave group" : "Delete group"}</button>
+        </div>
+      </nav>
+      <main className="page-shell">
+        {!cloudConfigured && <div className="cloud-setup-banner dashboard-cloud-banner"><div><strong>Local-only mode</strong><span>Your group is saved in this browser only. Configure Supabase to sign in and synchronize the same group across devices.</span></div><a href="https://github.com/ayushydv1805/HostelSplit#enable-cloud-mode" target="_blank" rel="noreferrer">Enable cloud sync ↗</a></div>}
+        <header className="page-heading">
+          <div><span className="eyebrow">{isCloud ? "SHARED WORKSPACE" : "LOCAL WORKSPACE"}</span><h1>{group.name}</h1><p>{members.length} members · {expenses.length} expenses · Updated as you go</p></div>
+          <div className="heading-actions"><button className="btn secondary" onClick={exportCsv}>↓ Export CSV</button><button className="btn secondary" onClick={exportPdf}>▤ Save PDF</button><button className="btn primary" onClick={() => openNewExpense()}>＋ Add expense</button></div>
+        </header>
+        {isCloud && <div className="invite-banner"><div><span className="invite-icon">↗</span><div><strong>Invite your group</strong><small>Share this code with a signed-in user to join the same live group.</small></div></div><div className="invite-code">{group.invite_code}<button onClick={() => { navigator.clipboard?.writeText(group.invite_code || "").then(() => setNotice("Invite code copied."), () => setNotice("Invite code: " + group.invite_code)); }} aria-label="Copy invite code">⧉</button></div></div>}
+        {error && <div className="alert error" role="alert">{error}<button onClick={() => setError("")} aria-label="Dismiss">×</button></div>}
+        {notice && <div className="alert success" role="status">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss">×</button></div>}
+        {loadingData && <div className="loading-strip">Refreshing shared group data…</div>}
+        <section className="stats-grid">
+          <article className="stat-card"><div className="stat-top"><span>Total recorded</span><span className="stat-icon purple">↗</span></div><strong>{money(totalSpent, currency)}</strong><small>Across all group expenses</small></article>
+          <article className="stat-card"><div className="stat-top"><span>This month</span><span className="stat-icon blue">▦</span></div><strong>{money(monthlyTotal, currency)}</strong><small>{monthlyExpenses.length} expenses in {monthFilter}</small></article>
+          <article className="stat-card"><div className="stat-top"><span>Members</span><span className="stat-icon green">♙</span></div><strong>{members.length}</strong><small>{paidSettlementCount} payments marked paid</small></article>
+          <article className="stat-card"><div className="stat-top"><span>Payments to settle</span><span className="stat-icon amber">⇄</span></div><strong>{pendingCount}</strong><small>Minimum transfers currently suggested</small></article>
+        </section>
+
+        <section className="dashboard-grid">
+          <div className="panel">
+            <div className="section-heading"><div><h2>Member balances</h2><p>What each person has paid versus their fair share.</p></div><span className="section-symbol">◉</span></div>
+            <div className="member-balance-list">
+              {members.map((member) => {
+                const balance = balances[member.id] || { paid: 0, share: 0, balance: 0 };
+                const label = balance.balance > 0.005 ? "Gets back" : balance.balance < -0.005 ? "Owes" : "Settled";
+                return <div className="balance-row" key={member.id}><span className="avatar">{member.name.slice(0, 1).toUpperCase()}</span><div className="balance-member"><strong>{member.name}{member.id === (user && user.id) ? " (you)" : ""}</strong><small>Paid {money(balance.paid, currency)} · Share {money(balance.share, currency)}</small></div><div className={"balance-number " + (balance.balance > 0.005 ? "positive-text" : balance.balance < -0.005 ? "negative-text" : "muted")}>{label}<strong>{money(Math.abs(balance.balance), currency)}</strong></div></div>;
+              })}
+              {!members.length && <EmptyState title="No members yet" body="Add members to start splitting group expenses." />}
+            </div>
+            {!isCloud && <button className="btn secondary small-button" onClick={() => setShowMemberForm((value) => !value)}>{showMemberForm ? "Close member form" : "＋ Add member"}</button>}
+            {showMemberForm && <form className="inline-form" onSubmit={addMember}><input value={memberInput} onChange={(event) => setMemberInput(event.target.value)} placeholder="Member name" required maxLength={80} /><button className="btn primary">Add</button></form>}
+          </div>
+
+          <div className="panel">
+            <div className="section-heading"><div><h2>Smart settlement</h2><p>Suggested payments to bring everyone close to zero.</p></div><span className="section-symbol">⇄</span></div>
+            {recommendedSettlements.length ? <div className="settlement-list">{recommendedSettlements.map((item, index) => {
+              const from = members.find((member) => member.id === item.from);
+              const to = members.find((member) => member.id === item.to);
+              return <div className="settlement-row" key={item.from + "-" + item.to + "-" + index}><div className="settlement-route"><span className="avatar">{(from ? from.name : "?").slice(0, 1)}</span><strong>{from ? from.name : "Member"}</strong><span className="route-arrow">→</span><span className="avatar receiver">{(to ? to.name : "?").slice(0, 1)}</span><strong>{to ? to.name : "Member"}</strong></div><div className="settlement-footer"><strong>{money(item.amount, currency)}</strong><button className="btn primary small-button" onClick={() => recordSettlement(item)} disabled={busy}>Mark paid</button></div></div>;
+            })}</div> : <EmptyState icon="✓" title="Everyone is settled" body="There are no pending transfers based on the expenses and recorded payments." />}
+          </div>
+
+          <div className="panel budget-panel">
+            <div className="section-heading"><div><h2>Monthly budget</h2><p>Monitor the current month and category limits.</p></div>{isGroupOwner ? <button className="text-button" onClick={() => { setBudgetInput(String(overallBudget || "")); setCategoryBudgetInput(String(selectedCategoryBudget?.amount || "")); setShowBudgetForm(true); }}>Edit budgets</button> : <span className="muted tiny">Owner-managed</span>}</div>
+            <div className="budget-summary"><div><small>Spent in {monthFilter}</small><strong>{money(monthlyTotal, currency)}</strong></div><div className="budget-target"><small>Budget</small><strong>{overallBudget > 0 ? money(overallBudget, currency) : "Not set"}</strong></div></div>
+            {overallBudget > 0 ? <><div className="progress-track"><div className={"progress-fill " + (monthlyBudgetUsage > 100 ? "over-budget" : "")} style={{ width: Math.min(100, monthlyBudgetUsage) + "%" }} /></div><div className="budget-foot"><span>{Math.round(monthlyBudgetUsage)}% used</span><strong className={monthlyBudgetUsage > 100 ? "negative-text" : "positive-text"}>{monthlyBudgetUsage > 100 ? money(monthlyTotal - overallBudget, currency) + " over" : money(overallBudget - monthlyTotal, currency) + " left"}</strong></div></> : <EmptyState icon="◎" title="Set a spending limit" body="Set a group budget and optional category limits to keep costs under control." action={<button className="btn secondary" onClick={() => { setBudgetInput(""); setCategoryBudgetInput(""); setShowBudgetForm(true); }}>Set budget</button>} />}
+            <div className="mini-category-list">{CATEGORIES.filter((category) => monthlyCategoryTotals[category]).slice(0, 4).map((category) => {
+              const limit = budgets.find((item) => item.category === category && item.month === activeMonthStart);
+              const amount = monthlyCategoryTotals[category] || 0;
+              return <div className="mini-category" key={category}><span>{CATEGORY_ICONS[category]} {category}</span><strong>{money(amount, currency)}</strong><small>{limit && Number(limit.amount) > 0 ? " / " + money(limit.amount, currency) : ""}</small></div>;
+            })}</div>
+          </div>
+
+          <div className="panel analytics-panel">
+            <div className="section-heading"><div><h2>Spending breakdown</h2><p>Category totals across this group.</p></div><span className="section-symbol">◔</span></div>
+            {totalSpent > 0 ? <div className="analytics-list">{Object.entries(categoryTotals).sort((a, b) => b[1] - a[1]).map(([category, amount]) => <div className="analytics-row" key={category}><div className="analytics-label"><span>{CATEGORY_ICONS[category] || "📦"} {category}</span><strong>{money(amount, currency)}</strong></div><div className="progress-track"><div className="progress-fill" style={{ width: (amount / totalSpent * 100) + "%" }} /></div><small>{Math.round(amount / totalSpent * 100)}% of total</small></div>)}</div> : <EmptyState icon="◔" title="No spending data yet" body="Add a group expense to see the breakdown." />}
+          </div>
+        </section>
+
+        <section className="panel expenses-panel">
+          <div className="section-heading expenses-heading"><div><h2>Expenses</h2><p>Search the ledger, filter a month, and edit or remove entries.</p></div><button className="btn primary" onClick={() => openNewExpense()}>＋ Add expense</button></div>
+          <div className="expense-filters"><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search expenses" placeholder="Search name, category, payer or receipt text…" /><select value={monthFilter} onChange={(event) => setMonthFilter(event.target.value)} aria-label="Filter by month"><option value="">All months</option>{Array.from(new Set(expenses.map((expense) => expense.date.slice(0, 7)))).sort().reverse().map((month) => <option key={month} value={month}>{month}</option>)}<option value={new Date().toISOString().slice(0, 7)}>{new Date().toISOString().slice(0, 7)} (current)</option></select><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} aria-label="Filter by category"><option value="All">All categories</option>{CATEGORIES.map((category) => <option key={category} value={category}>{category}</option>)}</select></div>
+          {filteredExpenses.length ? <div className="expense-table">
+            <div className="expense-table-head"><span>Expense</span><span>Paid by</span><span>Date</span><span>Amount</span><span>Actions</span></div>
+            {filteredExpenses.map((expense) => {
+              const payer = members.find((member) => member.id === expense.paidBy);
+              return <div className="expense-table-row" key={expense.id}><div className="expense-name-cell"><span className="expense-icon">{CATEGORY_ICONS[expense.category] || "📦"}</span><div><strong>{expense.name}</strong><small>{expense.category} · {expense.splits.length} split members · {expense.splitType}</small>{expense.receiptPath || expense.receiptDataUrl ? <button className="text-button receipt-link" onClick={() => openReceipt(expense)}>▧ View receipt</button> : null}</div></div><span className="payer-cell">{payer ? payer.name : expense.paidBy}</span><span className="date-cell">{expense.date}</span><strong className="amount-cell">{money(expense.amount, currency)}</strong><div className="row-actions"><button className="icon-action" onClick={() => openNewExpense(expense)} aria-label={"Edit " + expense.name}>✎</button><button className="icon-action danger-action" onClick={() => deleteExpense(expense)} aria-label={"Delete " + expense.name} disabled={busy}>×</button></div></div>;
+            })}
+          </div> : <EmptyState icon="▤" title={expenses.length ? "No matching expenses" : "No expenses yet"} body={expenses.length ? "Try changing the search or filters." : "Add your first expense to see who owes whom."} action={<button className="btn primary" onClick={() => openNewExpense()}>Add first expense</button>} />}
+        </section>
+
+        <section className="panel history-panel">
+          <div className="section-heading"><div><h2>Settlement history</h2><p>Recorded payments stay here even after balances change.</p></div><span className="section-symbol">◷</span></div>
+          {settlements.length ? <div className="history-list">{settlements.slice().sort((a, b) => String(b.date || b.createdAt || "").localeCompare(String(a.date || a.createdAt || ""))).map((item) => {
+            const from = members.find((member) => member.id === item.from);
+            const to = members.find((member) => member.id === item.to);
+            return <div className="history-row" key={item.id}><span className={"history-status " + (item.status === "paid" ? "done" : item.status === "cancelled" ? "cancelled" : "pending")}>{item.status === "paid" ? "✓" : item.status === "cancelled" ? "×" : "…"}</span><div className="history-detail"><strong>{from ? from.name : item.from} → {to ? to.name : item.to}</strong><small>{item.note || "Settlement"} · {String(item.date || item.createdAt || "").slice(0, 10)}</small></div><strong>{money(item.amount, currency)}</strong>{item.status === "paid" && <button className="text-button" onClick={() => undoSettlement(item)}>Undo</button>}</div>;
+          })}</div> : <EmptyState icon="◷" title="No settlements recorded" body="When someone pays a suggested transfer, it will appear here." />}
+        </section>
+
+        {isCloud && <section className="panel cloud-members-panel"><div className="section-heading"><div><h2>Group members</h2><p>Only signed-in users who have joined the invite code are included.</p></div></div><div className="cloud-member-chips">{members.map((member) => <span className="member-chip" key={member.id}><span className="avatar">{member.name.slice(0, 1)}</span><span>{member.name}</span>{member.role === "owner" && <small>Owner</small>}</span>)}</div></section>}
+        <footer className="app-footer"><span>HostelSplit</span><span>{isCloud ? "Cloud-synced group · Supabase row security enabled" : "Offline group · saved in this browser"}</span><span>Expenses are records, not money transfers.</span></footer>
       </main>
-      <section className="features"><div><span>⚡</span><h3>Smart Settlement</h3><p>Reduce the number of payments needed to settle the group.</p></div><div><span>📊</span><h3>Track Expenses</h3><p>Search, edit and understand spending by category.</p></div><div><span>🔒</span><h3>100% Private</h3><p>Your group data stays in your browser using local storage.</p></div></section>
-      {showCreate && <div className="modal-overlay"><div className="modal"><button className="close-btn" onClick={() => setShowCreate(false)}>×</button><h2>Create New Group</h2><p>Create a group and add your hostel friends.</p><input autoFocus value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="Group name e.g. Hostel Room 603" /><h3>Add Members</h3><div className="member-input"><input value={newMember} onChange={(e) => setNewMember(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addMember()} placeholder="Friend's name" /><button className="add-member-btn" onClick={addMember}>＋</button></div><div className="member-list">{members.map((member) => <div className="member-item" key={member}><span>👤 {member}</span><button onClick={() => removeMember(member)}>×</button></div>)}</div><button className="primary-btn full-btn" onClick={createGroup}>Create Group →</button><small className="hint">Add at least 2 members to start splitting.</small></div></div>}
+
+      {showExpenseForm && <div className="modal-backdrop"><form className="modal expense-modal" onSubmit={handleSaveExpense}>
+        <button type="button" className="close-button" onClick={() => setShowExpenseForm(false)} aria-label="Close">×</button>
+        <span className="eyebrow">{editingExpenseId ? "UPDATE LEDGER" : "NEW TRANSACTION"}</span><h2>{editingExpenseId ? "Edit expense" : "Add an expense"}</h2><p>Choose who paid, the people sharing it and how the amount should be split.</p>
+        <div className="form-grid"><label className="span-2">Expense name<input value={expenseForm.name} onChange={(event) => updateExpenseField("name", event.target.value)} required maxLength={180} placeholder="e.g. groceries, electricity, dinner" autoFocus /></label><label>Amount ({currency})<input type="number" value={expenseForm.amount} onChange={(event) => updateExpenseField("amount", event.target.value)} min="0.01" step="0.01" required placeholder="0.00" /></label><label>Date<input type="date" value={expenseForm.date} onChange={(event) => updateExpenseField("date", event.target.value)} max="2099-12-31" required /></label><label>Category<select value={expenseForm.category} onChange={(event) => updateExpenseField("category", event.target.value)}>{CATEGORIES.map((category) => <option key={category} value={category}>{CATEGORY_ICONS[category]} {category}</option>)}</select></label><label>Paid by<select value={expenseForm.paidBy} onChange={(event) => updateExpenseField("paidBy", event.target.value)} required>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label></div>
+        <div className="split-section"><div className="split-section-head"><div><h3>Split among</h3><small>Select the people who share this cost.</small></div><label>Split rule<select value={expenseForm.splitType} onChange={(event) => updateExpenseField("splitType", event.target.value)}><option value="equal">Equal split</option><option value="exact">Exact amounts</option><option value="percentage">Percentages</option></select></label></div>
+          <div className="split-choice-list">{members.map((member) => <label className="split-choice" key={member.id}><input type="checkbox" checked={expenseForm.selectedMembers.includes(member.id)} onChange={() => toggleSplitMember(member.id)} /><span className="avatar">{member.name.slice(0, 1).toUpperCase()}</span><strong>{member.name}</strong>{expenseForm.splitType !== "equal" && expenseForm.selectedMembers.includes(member.id) && <input className="split-value" type="number" min="0" step={expenseForm.splitType === "percentage" ? "0.01" : "0.01"} value={expenseForm.splitValues[member.id] || ""} onChange={(event) => setExpenseForm((current) => ({ ...current, splitValues: { ...current.splitValues, [member.id]: event.target.value } }))} placeholder={expenseForm.splitType === "percentage" ? "%" : "₹"} aria-label={"Split for " + member.name} />}</label>)}</div>
+          {expenseForm.splitType === "percentage" && <small className="hint-text">Percentages must add up to 100%. Amounts are rounded to the nearest paise.</small>}
+          {expenseForm.splitType === "exact" && <small className="hint-text">The exact amounts must add up to the expense total.</small>}
+        </div>
+        <div className="receipt-section"><div><h3>Receipt scan <span className="optional-tag">Optional</span></h3><small>Attach a receipt image. OCR runs in your browser and may need manual correction.</small></div><label className="upload-button">▧ {receiptBusy ? "Scanning…" : "Choose receipt"}<input type="file" accept="image/png,image/jpeg,image/webp" capture="environment" onChange={(event) => handleReceipt(event.target.files && event.target.files[0])} disabled={receiptBusy} /></label></div>
+        {receiptBusy && <div className="ocr-progress"><div className="progress-track"><div className="progress-fill" style={{ width: ocrProgress + "%" }} /></div><small>{ocrProgress ? "Reading text " + ocrProgress + "%" : "Preparing receipt…"}</small></div>}
+        {(expenseForm.receiptDataUrl || expenseForm.receiptPath) && <div className="receipt-preview">{expenseForm.receiptDataUrl && <img src={expenseForm.receiptDataUrl} alt="Selected receipt preview" />}{expenseForm.receiptPath && !expenseForm.receiptDataUrl && <span className="receipt-placeholder">▧ Receipt attached to cloud group</span>}<div><strong>{expenseForm.suggestedAmount ? "Suggested total: " + money(expenseForm.suggestedAmount, currency) : "Receipt attached"}</strong>{expenseForm.suggestedAmount && <button type="button" className="text-button" onClick={() => updateExpenseField("amount", String(expenseForm.suggestedAmount))}>Use suggested amount</button>}{expenseForm.receiptText && <details><summary>Extracted text preview</summary><p>{expenseForm.receiptText.slice(0, 1200)}</p></details>}</div><button type="button" className="text-button danger-text" onClick={() => setExpenseForm((current) => ({ ...current, receiptFile: null, receiptDataUrl: "", receiptPath: "", receiptText: "", suggestedAmount: null }))}>Remove</button></div>}
+        {error && <div className="alert error">{error}</div>}
+        <div className="modal-actions"><button type="button" className="btn secondary" onClick={() => setShowExpenseForm(false)}>Cancel</button><button type="submit" className="btn primary" disabled={busy || receiptBusy}>{busy ? "Saving…" : editingExpenseId ? "Save changes" : "Save expense"}</button></div>
+      </form></div>}
+
+      {showBudgetForm && <div className="modal-backdrop"><form className="modal" onSubmit={saveBudgets}><button type="button" className="close-button" onClick={() => setShowBudgetForm(false)} aria-label="Close">×</button><span className="eyebrow">BUDGET SETTINGS · {monthFilter || "ALL MONTHS"}</span><h2>Monthly spending limits</h2><p>Overall budget plus one category budget for the selected month.</p><label>Group monthly budget ({currency})<input type="number" min="0" step="0.01" value={budgetInput} onChange={(event) => setBudgetInput(event.target.value)} placeholder="0 means no limit" /></label><label>Category<select value={categoryBudgetName} onChange={(event) => { setCategoryBudgetName(event.target.value); const record = budgets.find((item) => item.category === event.target.value && item.month === activeMonthStart); setCategoryBudgetInput(record ? String(record.amount) : ""); }}>{CATEGORIES.filter((category) => category !== "All").map((category) => <option key={category} value={category}>{category}</option>)}</select></label><label>{categoryBudgetName} budget ({currency})<input type="number" min="0" step="0.01" value={categoryBudgetInput} onChange={(event) => setCategoryBudgetInput(event.target.value)} placeholder="0 means no limit" /></label>{error && <div className="alert error">{error}</div>}<div className="modal-actions"><button type="button" className="btn secondary" onClick={() => setShowBudgetForm(false)}>Cancel</button><button className="btn primary" disabled={busy}>{busy ? "Saving…" : "Save budgets"}</button></div></form></div>}
     </div>
   );
-}
-
-function ExpenseModal({ title = "Add Expense", form, setForm, members, onClose, onSave, toggleMember }) {
-  return <div className="modal-overlay"><div className="modal"><button className="close-btn" onClick={onClose}>×</button><h2>{title}</h2><p>{title === "Add Expense" ? "Add an expense and choose who shares it." : "Update the expense details."}</p><input autoFocus value={form.name} onChange={(e) => setForm((current) => ({ ...current, name: e.target.value }))} placeholder="Expense name e.g. Dinner" /><input type="number" min="0" step="0.01" value={form.amount} onChange={(e) => setForm((current) => ({ ...current, amount: e.target.value }))} placeholder="Amount ₹" /><label className="field-label">Category<select value={form.category} onChange={(e) => setForm((current) => ({ ...current, category: e.target.value }))}>{CATEGORIES.map((category) => <option key={category} value={category}>{CATEGORY_ICONS[category]} {category}</option>)}</select></label><label className="field-label">Paid by<select value={form.paidBy} onChange={(e) => setForm((current) => ({ ...current, paidBy: e.target.value }))}><option value="">Select person</option>{members.map((member) => <option key={member} value={member}>{member}</option>)}</select></label><div className="field-label">Split between<div className="split-members">{members.map((member) => <label className="check-row" key={member}><input type="checkbox" checked={form.members.includes(member)} onChange={() => toggleMember(member)} />{member}</label>)}</div></div><button className="primary-btn full-btn" onClick={onSave}>{title === "Add Expense" ? "Add Expense →" : "Save Changes →"}</button></div></div>;
 }
 
 export default App;
