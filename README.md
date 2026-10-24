@@ -33,39 +33,39 @@ HostelSplit runs offline with browser storage or in cloud mode with Supabase aut
 ### Offline mode
 - Without the Supabase environment variables, the app works in local mode.
 - Offline groups persist in the same browser's local storage and do not sync to other devices.
-- Existing \`hostelsplit-data\` data is migrated when possible.
+- Existing `hostelsplit-data` data is migrated when possible.
 
 ## Run locally
 
 Use a supported Node.js 24 release.
 
-\`\`\`bash
+```bash
 npm install
 npm run dev
-\`\`\`
+```
 
 Copy the environment template if you want cloud mode:
 
 PowerShell:
-\`\`\`powershell
+```powershell
 Copy-Item .env.example .env
-\`\`\`
+```
 
-Then replace the placeholders in \`.env\` with values from a **dedicated HostelSplit Supabase project**:
+Then replace the placeholders in `.env` with values from a **dedicated HostelSplit Supabase project**:
 
-\`\`\`dotenv
+```dotenv
 VITE_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
 VITE_SUPABASE_PUBLISHABLE_KEY=YOUR_SUPABASE_PUBLISHABLE_KEY
-\`\`\`
+```
 
 Restart the Vite server after changing environment variables.
 
 ## Enable cloud mode
 
 1. Create or select a **dedicated Supabase project for HostelSplit**. Do not reuse databases belonging to other apps.
-2. In that project's SQL Editor, run the complete \`supabase/schema.sql\` script. This creates the tables, indexes, RLS policies, invite-code function and private receipt bucket.
+2. In that project's SQL Editor, run the complete `supabase/schema.sql` script. This creates the tables, indexes, RLS policies, invite-code function and private receipt bucket.
 3. In Supabase Auth settings, set the Site URL to your deployed origin and add the local and deployed callback/redirect URLs. If email confirmation is enabled, users must verify their email before signing in.
-4. Add \`VITE_SUPABASE_URL\` and \`VITE_SUPABASE_PUBLISHABLE_KEY\` to the Vercel project's Production, Preview and Development environments. Use the project URL and publishable key from the dedicated HostelSplit project. A publishable key is safe for the browser only because the database is protected by RLS; **never put a service-role key in Vite or Vercel client variables**.
+4. Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` to the Vercel project's Production, Preview and Development environments. Use the project URL and publishable key from the dedicated HostelSplit project. A publishable key is safe for the browser only because the database is protected by RLS; **never put a service-role key in Vite or Vercel client variables**.
 5. Redeploy Vercel after adding or changing environment variables.
 6. Create an account, create a shared group, and have another account join using the group's invite code.
 
@@ -86,11 +86,11 @@ Marking a settlement as paid only records the status in HostelSplit. It does not
 
 ## Quality checks
 
-\`\`\`bash
+```bash
 npm test
 npm run lint
 npm run build
-\`\`\`
+```
 
 The tests cover currency validation, equal/exact/percentage splits, balance accounting and settlement calculation. GitHub Actions runs tests, lint and a production build on feature/fix branches and pull requests to main.
 
