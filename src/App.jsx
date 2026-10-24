@@ -3,13 +3,16 @@ import "./App.css";
 
 const STORAGE_KEY = "hostelsplit-data";
 const THEME_KEY = "hostelsplit-theme";
+const BACKUP_STORAGE_KEY = "hostelsplit-data-backup";
 const CATEGORIES = ["Food", "Travel", "Hotel", "Shopping", "Entertainment", "Other"];
 const CATEGORY_ICONS = { Food: "🍔", Travel: "🚕", Hotel: "🏨", Shopping: "🛍️", Entertainment: "🎬", Other: "📦" };
 
 const emptyExpense = { name: "", amount: "", paidBy: "", category: "Food", members: [] };
 
 function money(value) {
-  return `₹${Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+  const numeric = Number(value);
+  const safeValue = Number.isFinite(numeric) ? numeric : 0;
+  return "₹" + safeValue.toLocaleString("en-IN", { maximumFractionDigits: 2 });
 }
 
 function makeId() {
@@ -21,15 +24,61 @@ function loadSavedData() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const data = JSON.parse(raw);
-    if (!data || typeof data !== "object") return null;
+    if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+
+    const members = [];
+    const seenMembers = new Set();
+    (Array.isArray(data.members) ? data.members : []).forEach((value) => {
+      if (typeof value !== "string") return;
+      const name = value.trim().replace(/\s+/g, " ");
+      const key = name.toLocaleLowerCase("en-IN");
+      if (name && !seenMembers.has(key)) {
+        seenMembers.add(key);
+        members.push(name);
+      }
+    });
+
+    const canonicalMember = (value) => {
+      if (typeof value !== "string") return "";
+      return members.find((member) => member.toLocaleLowerCase("en-IN") === value.trim().toLocaleLowerCase("en-IN")) || "";
+    };
+
+    const expenses = (Array.isArray(data.expenses) ? data.expenses : [])
+      .filter((expense) => expense && typeof expense === "object" && !Array.isArray(expense))
+      .map((expense) => {
+        const amount = Number(expense.amount);
+        const splitMembers = [];
+        (Array.isArray(expense.members) ? expense.members : []).forEach((value) => {
+          const member = canonicalMember(value);
+          if (member && !splitMembers.includes(member)) splitMembers.push(member);
+        });
+        return {
+          id: typeof expense.id === "string" && expense.id ? expense.id : makeId(),
+          name: typeof expense.name === "string" ? expense.name.trim() : "",
+          amount,
+          paidBy: canonicalMember(expense.paidBy),
+          category: CATEGORIES.includes(expense.category) ? expense.category : "Other",
+          members: splitMembers,
+        };
+      })
+      .filter((expense) => expense.name && Number.isFinite(expense.amount) && Number.isSafeInteger(Math.round(expense.amount * 100)) && Math.round(expense.amount * 100) > 0 && expense.paidBy && expense.members.length > 0);
+
     return {
-      groupName: typeof data.groupName === "string" ? data.groupName : "",
-      members: Array.isArray(data.members) ? data.members : [],
-      expenses: Array.isArray(data.expenses) ? data.expenses : [],
-      paidSettlements: Array.isArray(data.paidSettlements) ? data.paidSettlements : [],
+      groupName: typeof data.groupName === "string" ? data.groupName.trim() : "",
+      members,
+      expenses,
+      paidSettlements: Array.isArray(data.paidSettlements) ? data.paidSettlements.filter((item) => typeof item === "string") : [],
     };
   } catch {
     return null;
+  }
+}
+
+function loadTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY) === "dark";
+  } catch {
+    return false;
   }
 }
 
@@ -39,7 +88,7 @@ function App() {
   const [members, setMembers] = useState(saved?.members || []);
   const [expenses, setExpenses] = useState(saved?.expenses || []);
   const [paidSettlements, setPaidSettlements] = useState(saved?.paidSettlements || []);
-  const [darkMode, setDarkMode] = useState(() => localStorage.getItem(THEME_KEY) === "dark");
+  const [darkMode, setDarkMode] = useState(loadTheme);
   const [showCreate, setShowCreate] = useState(false);
   const [showExpense, setShowExpense] = useState(false);
   const [editingExpense, setEditingExpense] = useState(null);
@@ -47,16 +96,23 @@ function App() {
   const [searchExpense, setSearchExpense] = useState("");
   const [expenseForm, setExpenseForm] = useState(emptyExpense);
 
-  const groupCreated = Boolean(groupName.trim() && members.length);
+  const groupCreated = Boolean(groupName.trim() && members.length >= 2);
 
   useEffect(() => {
-    localStorage.setItem(THEME_KEY, darkMode ? "dark" : "light");
-    document.documentElement.dataset.theme = darkMode ? "dark" : "light";
+    try {
+      localStorage.setItem(THEME_KEY, darkMode ? "dark" : "light");
+      document.documentElement.dataset.theme = darkMode ? "dark" : "light";
+    } catch {
+      // Theme preference is optional when browser storage is blocked.
+    }
   }, [darkMode]);
 
   useEffect(() => {
-    if (groupCreated) {
+    if (!groupCreated) return;
+    try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ groupName, members, expenses, paidSettlements }));
+    } catch {
+      // The app remains usable if storage is full or disabled.
     }
   }, [groupCreated, groupName, members, expenses, paidSettlements]);
 
@@ -123,12 +179,22 @@ function App() {
 
   const saveExpense = () => {
     const amount = Number(expenseForm.amount);
-    if (!expenseForm.name.trim() || !Number.isFinite(amount) || amount <= 0 || !expenseForm.paidBy || !expenseForm.members.length) {
-      window.alert("Enter an expense name, valid amount, payer and at least one person to split with.");
+    const validPayer = members.includes(expenseForm.paidBy);
+    const validSplitMembers = Array.isArray(expenseForm.members) && expenseForm.members.length > 0 && expenseForm.members.every((member) => members.includes(member));
+    if (!expenseForm.name.trim() || !Number.isFinite(amount) || !Number.isSafeInteger(Math.round(amount * 100)) || Math.round(amount * 100) <= 0 || !validPayer || !validSplitMembers) {
+      window.alert("Enter an expense name, a valid positive amount, a group member who paid, and at least one valid person to split with.");
       return;
     }
-    const expense = { id: makeId(), name: expenseForm.name.trim(), amount, paidBy: expenseForm.paidBy, category: expenseForm.category, members: [...expenseForm.members] };
+    const expense = {
+      id: makeId(),
+      name: expenseForm.name.trim(),
+      amount: Math.round(amount * 100) / 100,
+      paidBy: expenseForm.paidBy,
+      category: CATEGORIES.includes(expenseForm.category) ? expenseForm.category : "Other",
+      members: [...new Set(expenseForm.members)],
+    };
     setExpenses((current) => [...current, expense]);
+    setPaidSettlements([]);
     setExpenseForm(emptyExpense);
     setShowExpense(false);
   };
@@ -138,15 +204,29 @@ function App() {
   };
 
   const saveEdit = () => {
-    if (!editingExpense?.name.trim() || Number(editingExpense.amount) <= 0 || !editingExpense.paidBy || !editingExpense.members.length) {
-      window.alert("Please enter valid expense details.");
+    const amount = Number(editingExpense?.amount);
+    const validPayer = members.includes(editingExpense?.paidBy);
+    const validSplitMembers = Array.isArray(editingExpense?.members) && editingExpense.members.length > 0 && editingExpense.members.every((member) => members.includes(member));
+    if (!editingExpense || !editingExpense.name.trim() || !Number.isFinite(amount) || !Number.isSafeInteger(Math.round(amount * 100)) || Math.round(amount * 100) <= 0 || !validPayer || !validSplitMembers) {
+      window.alert("Please enter a name, a valid positive amount, a current group payer, and at least one valid person to split with.");
       return;
     }
-    setExpenses((current) => current.map((expense) => expense.id === editingExpense.id ? { ...editingExpense, name: editingExpense.name.trim(), amount: Number(editingExpense.amount) } : expense));
+    setExpenses((current) => current.map((expense) => expense.id === editingExpense.id ? {
+      ...editingExpense,
+      name: editingExpense.name.trim(),
+      amount: Math.round(amount * 100) / 100,
+      members: [...new Set(editingExpense.members)],
+    } : expense));
+    setPaidSettlements([]);
     setEditingExpense(null);
   };
 
-  const deleteExpense = (id) => setExpenses((current) => current.filter((expense) => expense.id !== id));
+  const deleteExpense = (id) => {
+    const expense = expenses.find((item) => item.id === id);
+    if (!expense || !window.confirm("Delete the expense \"" + expense.name + "\"?")) return;
+    setExpenses((current) => current.filter((item) => item.id !== id));
+    setPaidSettlements([]);
+  };
 
   const addMember = () => {
     const name = newMember.trim().replace(/\s+/g, " ");
@@ -160,6 +240,10 @@ function App() {
   };
 
   const removeMember = (member) => {
+    if (groupCreated && members.length <= 2) {
+      window.alert("A group must keep at least 2 members. Add another member before removing this one.");
+      return;
+    }
     if (expenses.some((expense) => expense.paidBy === member || expense.members.includes(member))) {
       window.alert("This member is used by an existing expense. Delete or edit those expenses first.");
       return;
@@ -178,7 +262,13 @@ function App() {
 
   const clearGroup = () => {
     if (!window.confirm("Delete this group and all its expenses? This cannot be undone.")) return;
-    localStorage.removeItem(STORAGE_KEY);
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(BACKUP_STORAGE_KEY);
+    } catch {
+      window.alert("Browser storage could not be cleared. Please check your browser privacy settings.");
+      return;
+    }
     setGroupName("");
     setMembers([]);
     setExpenses([]);
@@ -186,11 +276,51 @@ function App() {
     setSearchExpense("");
   };
 
+  const beginNewGroup = () => {
+    if (!window.confirm("Start a new group? This replaces the current group and deletes its saved data. Export your expenses first if you need a copy.")) return;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(BACKUP_STORAGE_KEY);
+    } catch {
+      window.alert("Browser storage could not be cleared. Please check your browser privacy settings.");
+      return;
+    }
+    setGroupName("");
+    setMembers([]);
+    setExpenses([]);
+    setPaidSettlements([]);
+    setSearchExpense("");
+    setNewMember("");
+    setShowCreate(true);
+  };
+
   const settlementKey = (settlement) => `${settlement.from}|${settlement.to}|${settlement.amount.toFixed(2)}`;
   const togglePaid = (settlement) => {
     const key = settlementKey(settlement);
     setPaidSettlements((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]);
   };
+
+  const exportExpensesCsv = () => {
+    if (!expenses.length) {
+      window.alert("Add at least one expense before exporting.");
+      return;
+    }
+    const escapeCsv = (value) => '"' + String(value ?? "").replace(/"/g, '""') + '"';
+    const rows = [
+      ["Expense", "Amount (INR)", "Paid By", "Category", "Split Members"],
+      ...expenses.map((expense) => [expense.name, Number(expense.amount).toFixed(2), expense.paidBy, expense.category, expense.members.join(", ")])
+    ];
+    const csv = "\uFEFF" + rows.map((row) => row.map(escapeCsv).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = (groupName || "hostelsplit").replace(/[^a-z0-9-_]+/gi, "-").toLowerCase() + "-expenses.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
 
   const startDemo = () => {
     setGroupName("Manali Trip");
@@ -209,9 +339,10 @@ function App() {
     return (
       <div className={`app dashboard-app ${darkMode ? "dark" : ""}`}>
         <nav className="navbar">
-          <button className="brand-button" onClick={() => setGroupName("")}><span>💸</span> HostelSplit</button>
+          <div className="brand-button"><span>💸</span> HostelSplit</div>
           <div className="nav-actions">
             <button className="icon-btn" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>
+            <button className="secondary-btn new-group-btn" onClick={beginNewGroup}>＋ New Group</button>
             <button className="danger-btn" onClick={clearGroup}>🗑 Clear Group</button>
           </div>
         </nav>
@@ -262,7 +393,7 @@ function App() {
           </section>}
 
           <section className="panel">
-            <div className="section-title expenses-title"><div><h2>🧾 Recent Expenses</h2><span>{expenses.length} expenses</span></div><input className="expense-search" value={searchExpense} onChange={(e) => setSearchExpense(e.target.value)} placeholder="🔎 Search expenses..." /></div>
+            <div className="section-title expenses-title"><div><h2>🧾 Recent Expenses</h2><span>{expenses.length} expenses</span></div><div className="expense-tools"><button className="secondary-btn export-btn" onClick={exportExpensesCsv}>↓ Export CSV</button><input className="expense-search" value={searchExpense} onChange={(e) => setSearchExpense(e.target.value)} placeholder="🔎 Search expenses..." /></div></div>
             {filteredExpenses.length === 0 ? <div className="empty-state"><div>🧾</div><h3>{expenses.length ? "No matching expenses" : "No expenses yet"}</h3><p>{expenses.length ? "Try another search." : "Add your first expense and HostelSplit will calculate everyone's share."}</p>{!expenses.length && <button className="primary-btn" onClick={openNewExpense}>＋ Add First Expense</button>}</div> : <div className="expense-list">
               {filteredExpenses.map(({ expense }) => <div className="expense-item" key={expense.id}>
                 <div className="expense-icon">{CATEGORY_ICONS[expense.category] || "🧾"}</div><div className="expense-info"><b>{expense.name}</b><small>{expense.category} · {expense.paidBy} paid {money(expense.amount)}</small><small>Split between {expense.members.length} people</small></div><strong className="expense-amount">{money(expense.amount)}</strong><div className="expense-actions"><button className="ghost-btn" onClick={() => openEdit(expense)}>✏️ Edit</button><button className="ghost-btn danger-text" onClick={() => deleteExpense(expense.id)}>🗑 Delete</button></div>
