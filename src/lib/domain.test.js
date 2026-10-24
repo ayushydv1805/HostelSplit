@@ -82,14 +82,12 @@ test("minimum settlement plan clears member balances with exact cents", () => {
     { from: "b", to: "a", amount: 3.33 },
     { from: "c", to: "a", amount: 3.33 },
   ]);
-  const net = { a: 0, b: 0, c: 0 };
+  const remaining = { a: 6.66, b: -3.33, c: -3.33 };
   settlements.forEach(({ from, to, amount }) => {
-    net[from] += amount;
-    net[to] -= amount;
+    remaining[from] = Math.round((remaining[from] + amount) * 100) / 100;
+    remaining[to] = Math.round((remaining[to] - amount) * 100) / 100;
   });
-  assert.equal(net.a, 6.66);
-  assert.equal(net.b, -3.33);
-  assert.equal(net.c, -3.33);
+  assert.deepEqual(remaining, { a: 0, b: 0, c: 0 });
 });
 
 test("paid settlements reduce the outstanding debt in member balances", () => {
