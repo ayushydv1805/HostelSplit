@@ -30,7 +30,12 @@ const CATEGORY_ICONS = {
   Food: "🍔", Travel: "🚕", Hotel: "🏨", Shopping: "🛍️", Entertainment: "🎬",
   Utilities: "💡", Supplies: "🧻", Other: "📦",
 };
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return now.getFullYear() + "-" + month + "-" + day;
+};
 
 function makeId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
@@ -87,12 +92,17 @@ function normalizeExpense(raw, members) {
     }
   }
   splits = splits.filter((split) => split && memberIds.has(String(split.memberId || split.user_id || "")))
-    .map((split) => ({
-      memberId: String(split.memberId || split.user_id),
-      amount: Math.max(0, Math.round(Number(split.amount != null ? split.amount : split.share_amount || 0) * 100) / 100),
-    }));
-  const splitTotal = Math.round(splits.reduce((sum, split) => sum + split.amount, 0) * 100) / 100;
-  if (!name || amount === null || !memberIds.has(paidBy) || splits.length === 0 || Math.abs(splitTotal - amount) > 0.01) return null;
+    .map((split) => {
+      const rawShare = Number(split.amount != null ? split.amount : split.share_amount);
+      if (!Number.isFinite(rawShare) || rawShare < 0 || !Number.isSafeInteger(Math.round(rawShare * 100))) return null;
+      return {
+        memberId: String(split.memberId || split.user_id),
+        amount: Math.round(rawShare * 100) / 100,
+      };
+    });
+  if (splits.some((split) => !split)) return null;
+  const splitTotalCents = splits.reduce((sum, split) => sum + Math.round(split.amount * 100), 0);
+  if (!name || amount === null || !memberIds.has(paidBy) || splits.length === 0 || splitTotalCents !== Math.round(amount * 100)) return null;
   return {
     id: String(raw.id || makeId()),
     name,
@@ -451,7 +461,7 @@ function App() {
     return result;
   }, [monthlyExpenses]);
   const overallBudgetRecord = budgets.find((item) => item.category === "All" && item.month === activeMonthStart);
-  const overallBudget = overallBudgetRecord ? Number(overallBudgetRecord.amount || 0) : Number((!isCloud && group && group.monthly_budget) || 0);
+  const overallBudget = overallBudgetRecord ? Number(overallBudgetRecord.amount || 0) : 0;
   const selectedCategoryBudget = budgets.find((item) => item.category === categoryBudgetName && item.month === activeMonthStart);
   const isGroupOwner = !isCloud || Boolean(user && (group.created_by === user.id || members.some((member) => member.id === user.id && member.role === "owner")));
   const filteredExpenses = useMemo(() => {
