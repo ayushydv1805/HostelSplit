@@ -411,7 +411,7 @@ function LocalAuthScreen({ onBack, onComplete }) {
   );
 }
 
-function EmptyState({ icon, title, body, action })
+function EmptyState({ icon, title, body, action }) {
   return <div className="empty-state"><div className="empty-icon">{icon || "✦"}</div><h3>{title}</h3><p>{body}</p>{action}</div>;
 }
 
