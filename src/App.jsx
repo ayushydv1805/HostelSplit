@@ -14,7 +14,6 @@ function money(value) {
   const safeValue = Number.isFinite(numeric) ? numeric : 0;
   return "₹" + safeValue.toLocaleString("en-IN", { maximumFractionDigits: 2 });
 }
-}
 
 function makeId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -81,7 +80,6 @@ function loadTheme() {
   } catch {
     return false;
   }
-}
 }
 
 function App() {
@@ -200,7 +198,6 @@ function App() {
     setExpenseForm(emptyExpense);
     setShowExpense(false);
   };
-  };
 
   const openEdit = (expense) => {
     setEditingExpense({ ...expense, amount: String(expense.amount), members: [...expense.members] });
@@ -222,7 +219,6 @@ function App() {
     } : expense));
     setPaidSettlements([]);
     setEditingExpense(null);
-  };
   };
 
   const deleteExpense = (id) => {
@@ -253,7 +249,6 @@ function App() {
       return;
     }
     setMembers((current) => current.filter((item) => item !== member));
-  };
   };
 
   const createGroup = () => {
