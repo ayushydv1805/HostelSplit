@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   callRpc,
   clearCachedSession,
+  completePasswordRecovery,
   cloudConfigured,
   deleteRows,
   getCachedSession,
@@ -162,9 +163,17 @@ function firstError(error, fallback) {
 }
 
 function AuthScreen({ onBack, onComplete }) {
-  const [view, setView] = useState("signin");
+  const [view, setView] = useState(() => {
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    return params.get("type") === "recovery" ? "changePassword" : "signin";
+  });
+  const [recoveryToken, setRecoveryToken] = useState(() => {
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    return params.get("type") === "recovery" ? params.get("access_token") || "" : "";
+  });
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -176,6 +185,14 @@ function AuthScreen({ onBack, onComplete }) {
     setNotice("");
     if (view !== "reset" && password.length < 8) {
       setError("Use a password with at least 8 characters.");
+      return;
+    }
+    if (view === "changePassword" && password !== confirmPassword) {
+      setError("The passwords do not match.");
+      return;
+    }
+    if (view === "changePassword" && !recoveryToken) {
+      setError("This recovery link is missing its token. Request a new password-reset email.");
       return;
     }
     setBusy(true);
@@ -194,10 +211,18 @@ function AuthScreen({ onBack, onComplete }) {
           setNotice("Account created. Check your email to confirm your address, then sign in.");
           setView("signin");
         }
-      } else {
+      } else if (view === "reset") {
         await requestPasswordReset(email);
         setNotice("If the account exists, Supabase will send a password-reset email.");
         setView("signin");
+      } else {
+        await completePasswordRecovery(recoveryToken, password);
+        window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+        setRecoveryToken("");
+        setPassword("");
+        setConfirmPassword("");
+        setView("signin");
+        setNotice("Password updated successfully. Sign in with your new password.");
       }
     } catch (caught) {
       setError(firstError(caught, "Authentication failed. Please try again."));
@@ -218,17 +243,20 @@ function AuthScreen({ onBack, onComplete }) {
         </section>
         <form className="auth-card" onSubmit={submit}>
           <div className="auth-card-icon">✦</div>
-          <h2>{view === "signin" ? "Welcome back" : view === "signup" ? "Create your account" : "Reset password"}</h2>
-          <p>{view === "signin" ? "Sign in to open your shared groups." : view === "signup" ? "Start a group with your hostel friends." : "We’ll email you a password reset link."}</p>
+          <h2>{view === "signin" ? "Welcome back" : view === "signup" ? "Create your account" : view === "changePassword" ? "Choose a new password" : "Reset password"}</h2>
+          <p>{view === "signin" ? "Sign in to open your shared groups." : view === "signup" ? "Start a group with your hostel friends." : view === "changePassword" ? "Choose a new password for your account." : "We’ll email you a password reset link."}</p>
           {view === "signup" && <label>Your name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="name" required placeholder="e.g. Ayush Yadav" /></label>}
-          <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required placeholder="you@example.com" /></label>
-          {view !== "reset" && <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={view === "signin" ? "current-password" : "new-password"} minLength={8} required placeholder="At least 8 characters" /></label>}
+          {view !== "changePassword" && <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required placeholder="you@example.com" /></label>}
+          {view !== "reset" && <label>{view === "changePassword" ? "New password" : "Password"}<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={view === "signin" ? "current-password" : "new-password"} minLength={8} required placeholder="At least 8 characters" /></label>}
+          {view === "changePassword" && <label>Confirm new password<input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" minLength={8} required placeholder="Enter the new password again" /></label>}
           {error && <div className="alert error">{error}</div>}
           {notice && <div className="alert success">{notice}</div>}
-          <button className="btn primary full" type="submit" disabled={busy}>{busy ? "Please wait…" : view === "signin" ? "Sign in" : view === "signup" ? "Create account" : "Send reset link"}</button>
+          <button className="btn primary full" type="submit" disabled={busy}>{busy ? "Please wait…" : view === "signin" ? "Sign in" : view === "signup" ? "Create account" : view === "changePassword" ? "Update password" : "Send reset link"}</button>
           <div className="auth-links">
-            {view === "signin" && <button type="button" onClick={() => setView("reset")}>Forgot password?</button>}
-            <button type="button" onClick={() => { setView(view === "signup" ? "signin" : "signup"); setError(""); setNotice(""); }}>{view === "signup" ? "Already have an account? Sign in" : "New here? Create an account"}</button>
+            {view === "changePassword" ? <button type="button" onClick={() => { setView("signin"); setRecoveryToken(""); setPassword(""); setConfirmPassword(""); window.history.replaceState({}, document.title, window.location.pathname + window.location.search); }}>Back to sign in</button> : <>
+              {view === "signin" && <button type="button" onClick={() => { setView("reset"); setError(""); setNotice(""); }}>Forgot password?</button>}
+              <button type="button" onClick={() => { setView(view === "signup" ? "signin" : "signup"); setError(""); setNotice(""); }}>{view === "signup" ? "Already have an account? Sign in" : "New here? Create an account"}</button>
+            </>}
           </div>
           <button type="button" className="btn secondary full" onClick={onBack}>Continue offline instead</button>
           <small className="muted tiny">Cloud access requires the database schema from supabase/schema.sql and valid Vite environment variables.</small>
