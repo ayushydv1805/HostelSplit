@@ -61,7 +61,7 @@ function loadSavedData() {
           members: splitMembers,
         };
       })
-      .filter((expense) => expense.name && Number.isFinite(expense.amount) && expense.amount > 0 && expense.paidBy && expense.members.length > 0);
+      .filter((expense) => expense.name && Number.isFinite(expense.amount) && Number.isSafeInteger(Math.round(expense.amount * 100)) && Math.round(expense.amount * 100) > 0 && expense.paidBy && expense.members.length > 0);
 
     return {
       groupName: typeof data.groupName === "string" ? data.groupName.trim() : "",
@@ -181,7 +181,7 @@ function App() {
     const amount = Number(expenseForm.amount);
     const validPayer = members.includes(expenseForm.paidBy);
     const validSplitMembers = Array.isArray(expenseForm.members) && expenseForm.members.length > 0 && expenseForm.members.every((member) => members.includes(member));
-    if (!expenseForm.name.trim() || !Number.isFinite(amount) || amount <= 0 || !validPayer || !validSplitMembers) {
+    if (!expenseForm.name.trim() || !Number.isFinite(amount) || !Number.isSafeInteger(Math.round(amount * 100)) || Math.round(amount * 100) <= 0 || !validPayer || !validSplitMembers) {
       window.alert("Enter an expense name, a valid positive amount, a group member who paid, and at least one valid person to split with.");
       return;
     }
@@ -207,7 +207,7 @@ function App() {
     const amount = Number(editingExpense?.amount);
     const validPayer = members.includes(editingExpense?.paidBy);
     const validSplitMembers = Array.isArray(editingExpense?.members) && editingExpense.members.length > 0 && editingExpense.members.every((member) => members.includes(member));
-    if (!editingExpense || !editingExpense.name.trim() || !Number.isFinite(amount) || amount <= 0 || !validPayer || !validSplitMembers) {
+    if (!editingExpense || !editingExpense.name.trim() || !Number.isFinite(amount) || !Number.isSafeInteger(Math.round(amount * 100)) || Math.round(amount * 100) <= 0 || !validPayer || !validSplitMembers) {
       window.alert("Please enter a name, a valid positive amount, a current group payer, and at least one valid person to split with.");
       return;
     }
@@ -300,7 +300,7 @@ function App() {
     document.body.appendChild(link);
     link.click();
     link.remove();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
 
