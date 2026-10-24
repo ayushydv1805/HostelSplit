@@ -347,8 +347,7 @@ drop policy if exists "settlements_update_member" on public.settlements;
 create policy "settlements_update_member" on public.settlements for update to authenticated
 using ((select private.hostelsplit_is_group_member(group_id)))
 with check (
-  created_by = (select auth.uid())
-  and (select private.hostelsplit_is_group_member(group_id))
+  (select private.hostelsplit_is_group_member(group_id))
   and (select private.hostelsplit_can_share_with_user(group_id, from_user))
   and (select private.hostelsplit_can_share_with_user(group_id, to_user))
 );
