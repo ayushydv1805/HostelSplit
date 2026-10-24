@@ -117,12 +117,25 @@ export async function getCurrentUser(session) {
 }
 
 export async function requestPasswordReset(email) {
-  const response = await fetch(SUPABASE_URL + "/auth/v1/recover", {
+  const redirectTo = typeof window !== "undefined" ? window.location.origin : undefined;
+  const url = SUPABASE_URL + "/auth/v1/recover" + (redirectTo ? "?redirect_to=" + encodeURIComponent(redirectTo) : "");
+  const response = await fetch(url, {
     method: "POST",
     headers: headers(null, { "Content-Type": "application/json" }),
     body: JSON.stringify({ email: email.trim().toLowerCase() }),
   });
   await readResponse(response);
+}
+
+export async function completePasswordRecovery(accessToken, password) {
+  if (!cloudConfigured) throw new Error("Cloud login is not configured.");
+  if (!accessToken) throw new Error("This password-reset link is missing its recovery token. Request a fresh link and try again.");
+  const response = await fetch(SUPABASE_URL + "/auth/v1/user", {
+    method: "PUT",
+    headers: headers({ access_token: accessToken }, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ password }),
+  });
+  return readResponse(response);
 }
 
 async function restRequest(path, options, session) {
