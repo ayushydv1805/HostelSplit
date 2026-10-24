@@ -257,7 +257,6 @@ function App() {
   const [darkMode, setDarkMode] = useState(() => {
     try { return localStorage.getItem("hostelsplit-theme") === "dark"; } catch { return false; }
   });
-  const [authBusy, setAuthBusy] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState(null);
   const [groupListVersion, setGroupListVersion] = useState(0);
@@ -327,18 +326,7 @@ function App() {
   }, [localMode, hasSession]);
 
   useEffect(() => {
-    if (!cloudSession) {
-      setCloudGroups([]);
-      setActiveGroupId("");
-      if (!isCloud && group && group.source === "cloud") {
-        setGroup(initialLocal.group);
-        setMembers(initialLocal.members);
-        setExpenses(initialLocal.expenses);
-        setSettlements(initialLocal.settlements || []);
-        setBudgets(initialLocal.budgets || []);
-      }
-      return undefined;
-    }
+    if (!cloudSession) return undefined;
     let active = true;
     const loadGroups = async () => {
       setLoadingData(true);
@@ -440,7 +428,7 @@ function App() {
       localStorage.setItem(LOCAL_KEY, JSON.stringify(snapshot));
       // Keep old backup data out of the new storage path; Clear Group removes both.
     } catch {
-      setError("Browser storage is full. Export your expenses and remove a receipt image or large browser data before continuing.");
+      window.setTimeout(() => setError("Browser storage is full. Export your expenses and remove a receipt image or large browser data before continuing."), 0);
     }
   }, [isCloud, group, members, expenses, settlements, budgets]);
 
@@ -1055,7 +1043,7 @@ function App() {
       <nav className="navbar">
         <a className="brand" href="#" onClick={(event) => event.preventDefault()}><span className="brand-mark">H</span> HostelSplit</a>
         <div className="nav-actions">
-          {isCloud && <span className="secure-tag desktop-only">☁ Synced</span>}
+          {isCloud && <span className="secure-tag desktop-only" title={lastSyncAt ? "Last synced " + new Date(lastSyncAt).toLocaleTimeString() : "Synced with Supabase"}>☁ Synced{lastSyncAt ? " · " + new Date(lastSyncAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</span>}
           <button className="icon-button" onClick={() => setDarkMode((value) => !value)} aria-label="Toggle theme">{darkMode ? "☀️" : "🌙"}</button>
           {isCloud && <button className="btn secondary desktop-only" onClick={() => { setActiveGroupId(""); setGroup(null); setGroupListVersion((value) => value + 1); }}>All groups</button>}
           {isCloud && <button className="btn secondary desktop-only" onClick={handleLogout}>Sign out</button>}
