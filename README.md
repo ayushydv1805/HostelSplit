@@ -7,7 +7,7 @@ HostelSplit runs offline with browser storage or in cloud mode with Supabase aut
 ## Features
 
 ### Expenses and settlement
-- Create groups and manage members.
+- Create groups and manage members; choose a group currency (INR, USD, EUR, GBP, NPR, CAD or AUD).
 - Record expenses with a payer, category, date and shared members.
 - Split by equal shares, exact amounts or percentages, with cent/paise-safe allocation.
 - Calculate balances and recommend low-count settlement transfers.
@@ -27,7 +27,7 @@ HostelSplit runs offline with browser storage or in cloud mode with Supabase aut
 - Password-reset email flow.
 - Create a shared group and invite other signed-in accounts using a code.
 - Cloud group data, expenses, split shares, budgets and settlements persist in Supabase after the page is closed.
-- Shared group data refreshes periodically while the group is open.
+- Shared group data refreshes periodically while the group is open.\n- Installable PWA with a cached app shell; cloud API requests are not cached by the service worker.
 - Row Level Security (RLS) policies restrict group data to authenticated members.
 
 ### Offline mode
