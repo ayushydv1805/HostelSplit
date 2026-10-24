@@ -10,7 +10,7 @@
   "theme_color": "#635bff",
   "icons": [
     {
-      "src": "/favicon.svg",
+      "src": "/hostelsplit-icon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any maskable"
